@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+#pickle files
+*.pkl
+
+#final predictions csv
+predictions_final.csv

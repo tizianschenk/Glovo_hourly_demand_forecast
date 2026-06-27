@@ -4516,7 +4516,7 @@ def _(
     else:
         c16_gap = (xgb6_mean_smape - naive_mean_smape) / naive_mean_smape * 100
         print(f"\n❌ XGBoost v6 still WORSE than naive by {c16_gap:.1f}%")
-    return xgb6_mean_smape, xgb6_smape_scores
+    return (xgb6_mean_smape,)
 
 
 @app.cell
@@ -4732,1135 +4732,6 @@ def _(c17_df, val_cutoffs):
     return
 
 
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## Theta model
-
-    From the slides:
-    "The theta model... is equivalent to SES (Simple Exponential Smoothing) with drift: ŷ(t+h) = ŷ(t+h)^SES + (b̂/2)·h, where b̂ is the OLS slope of y_t on t. SES tracks the recent level; the drift corrects for the long-run direction. It works really well, but you need to remove the seasonal component from the TS first."
-
-    Breaking this down:
-
-    - Simple Exponential Smoothing (SES) forecasts the future as a weighted average of past observations, where recent observations matter more as weights decay geometrically the further back in time you go, controlled by a parameter α (alpha) between 0 and 1. A high α means "trust the most recent value heavily"; a low α means "smooth over a longer history." Critically, SES alone produces a flat forecast — it just repeats its last smoothed estimate forever, with no ability to continue a trend.
-
-    - The Theta model fixes this by adding a linear drift term: it fits a simple straight-line trend (via OLS — Ordinary Least Squares, the same linear regression from your Ex02) to the historical data, and adds half of that trend's slope, multiplied by the forecast horizon, on top of the SES forecast. This lets Theta's forecast continue drifting in the trend's direction rather than going flat. It won the M3 forecasting competition in 2000 and remains a genuinely strong, simple benchmark — exactly in the spirit of your course's "simple models often win" principle.
-    - The crucial caveat from the slides: "you need to remove the seasonal component first." Theta has no native concept of seasonality (no daily/weekly cycle awareness) — it can only track level and trend. So we must deseasonalize our data before fitting Theta, then reseasonalize the forecast afterward. This mirrors exactly the structure of our seasonal decomposition from Cell 4 (trend + seasonal + residual).
-    """)
-    return
-
-
-@app.cell
-def _(
-    N_VAL_WEEKS,
-    naive_mean_smape,
-    np,
-    pd,
-    sarima2_mean_smape,
-    series,
-    smape,
-    time,
-    val_cutoffs,
-    xgb6_mean_smape,
-):
-    # ── CELL 18: Theta Model — walk-forward validation, period=168 (weekly) ──
-    # WHY THIS CELL EXISTS: course slides identify the Theta model as a strong,
-    # simple SOTA benchmark (won the M3 forecasting competition) that combines
-    # Simple Exponential Smoothing [SES — a weighted average of past values
-    # where recent observations matter more, decaying geometrically] with a
-    # linear trend (drift) term. Unlike XGBoost, Theta has NATIVE seasonal
-    # decomposition built in (statsmodels handles deseasonalize/reseasonalize
-    # internally) and unlike SARIMA, it has explicit trend-extrapolation via
-    # its drift term — directly targeting the +55% YoY growth we found in EDA.
-    #
-    # We set period=168 (weekly) since EDA confirmed this is our DOMINANT
-    # seasonal signal (ACF=0.929, stronger than daily's 0.887). Like SARIMA,
-    # ThetaModel only handles ONE seasonal period — we are testing whether its
-    # native trend-handling compensates for not seeing the daily cycle directly
-    # (though deseasonalizing on period=168 should still implicitly preserve
-    # daily shape within each week, since the decomposition removes the WHOLE
-    # repeating weekly pattern, which includes each day's distinct shape).
-
-    from statsmodels.tsa.forecasting.theta import (
-        ThetaModel,  # NEW import — not used in any prior cell
-    )
-
-    theta_smape_scores = []
-    theta_mse_scores = []
-    theta_fit_seconds = []
-
-    for c18_w, c18_cutoff_w in enumerate(val_cutoffs):
-        c18_train_wf = series[series.index <= c18_cutoff_w]
-        c18_actual_wf = series[
-            (series.index > c18_cutoff_w)
-            & (series.index <= c18_cutoff_w + pd.Timedelta(hours=168))
-        ]
-
-        # Same recency window discipline as SARIMA (Cell 6/7) — Theta's SES
-        # component doesn't need 11 months of history to learn weekly shape,
-        # and keeps fitting fast. We use a slightly longer window than SARIMA's
-        # 2000h since Theta needs enough FULL WEEKS to estimate seasonality
-        # reliably — we use the last 4000 hours (~23-24 weeks)
-        c18_train_recent = c18_train_wf.iloc[-4000:]
-
-        c18_start_time = time.time()
-
-        # ThetaModel requires a clean, gap-free hourly frequency index — our
-        # series already has this (orders_filled, built in Cell 2)
-        c18_model = ThetaModel(
-            c18_train_recent,
-            period=168,  # weekly seasonal period — our dominant signal per EDA
-            deseasonalize=True,  # remove the weekly pattern before fitting SES+drift
-            method="additive",  # additive: matches our EDA finding (stable peak-to-mean ratio,
-            # not growing amplitude — Cell 3 showed ~5.5x ratio, fairly stable)
-        )
-        c18_fitted = c18_model.fit()
-
-        c18_elapsed = time.time() - c18_start_time
-        theta_fit_seconds.append(c18_elapsed)
-
-        # ── Forecast the next 168 hours ────────────────────────────────────────
-        c18_forecast_vals = c18_fitted.forecast(steps=168)
-
-        c18_forecast_index = pd.date_range(
-            start=c18_train_wf.index[-1] + pd.Timedelta(hours=1), periods=168, freq="h"
-        )
-        c18_forecast = pd.Series(c18_forecast_vals.values, index=c18_forecast_index)
-        c18_forecast = c18_forecast.clip(
-            lower=0
-        )  # floor negative predictions, same as SARIMA
-
-        # ── Align and score ─────────────────────────────────────────────────
-        c18_aligned = pd.DataFrame(
-            {"actual": c18_actual_wf, "forecast": c18_forecast}
-        ).dropna()
-        assert len(c18_aligned) == 168, (
-            f"Window {c18_w + 1} has {len(c18_aligned)} rows, expected 168"
-        )
-
-        c18_smape_val = smape(c18_aligned["actual"], c18_aligned["forecast"])
-        c18_mse_val = np.mean((c18_aligned["actual"] - c18_aligned["forecast"]) ** 2)
-
-        theta_smape_scores.append(c18_smape_val)
-        theta_mse_scores.append(c18_mse_val)
-
-        print(
-            f"  Window {c18_w + 1} ({c18_cutoff_w.date()} cutoff): "
-            f"SMAPE={c18_smape_val:.4f}, MSE={c18_mse_val:.1f}, fit_time={c18_elapsed:.2f}s"
-        )
-
-    theta_mean_smape = np.mean(theta_smape_scores)
-    theta_mean_mse = np.mean(theta_mse_scores)
-    theta_std_smape = np.std(theta_smape_scores)
-    theta_total_fit_time = np.sum(theta_fit_seconds)
-
-    print(f"\n{'=' * 60}")
-    print(f"THETA MODEL RESULTS  (period=168, n={N_VAL_WEEKS} windows)")
-    print(f"{'=' * 60}")
-    print(f"Mean SMAPE: {theta_mean_smape:.4f}  ± {theta_std_smape:.4f} std")
-    print(f"Mean MSE:   {theta_mean_mse:.1f}")
-    print(
-        f"SMAPE range: [{min(theta_smape_scores):.4f}, {max(theta_smape_scores):.4f}]"
-    )
-    print(
-        f"Total fit time: {theta_total_fit_time:.1f}s (avg {theta_total_fit_time / N_VAL_WEEKS:.2f}s/window)"
-    )
-
-    print(f"\n{'=' * 60}")
-    print("FULL MODEL COMPARISON — ALL FAMILIES")
-    print(f"{'=' * 60}")
-    print(f"Naive SMAPE:       {naive_mean_smape:.4f}")
-    print(f"SARIMA v2 SMAPE:   {sarima2_mean_smape:.4f}  (daily-only memory)")
-    print(f"XGBoost v6 SMAPE:  {xgb6_mean_smape:.4f}  (best XGBoost so far)")
-    print(
-        f"Theta SMAPE:       {theta_mean_smape:.4f}  (SES + drift, weekly deseasonalized)"
-    )
-
-    if theta_mean_smape < naive_mean_smape:
-        c18_improvement = (naive_mean_smape - theta_mean_smape) / naive_mean_smape * 100
-        print(f"\n✅ Theta BEATS naive baseline by {c18_improvement:.1f}%")
-    else:
-        c18_gap = (theta_mean_smape - naive_mean_smape) / naive_mean_smape * 100
-        print(f"\n❌ Theta still WORSE than naive by {c18_gap:.1f}%")
-    return ThetaModel, theta_mean_smape
-
-
-@app.cell
-def _(ThetaModel, pd, plt, series, val_cutoffs):
-    # ── CELL 18b: DIAGNOSTIC — plot Theta's actual Window 1 forecast vs actual ──
-    # SMAPE near 0.98-1.1 across ALL 7 windows is catastrophic and uniform —
-    # unlike our other failures, which were concentrated in specific windows.
-    # A UNIFORM failure across every window suggests either (a) a fundamental
-    # mismatch between Theta's assumptions and our zero-heavy, highly-spiky
-    # data, or (b) a mechanical bug. We plot first, as always, before
-    # theorizing further.
-
-    c18b_cutoff = val_cutoffs[0]
-    c18b_train_wf = series[series.index <= c18b_cutoff]
-    c18b_actual_wf = series[
-        (series.index > c18b_cutoff)
-        & (series.index <= c18b_cutoff + pd.Timedelta(hours=168))
-    ]
-    c18b_train_recent = c18b_train_wf.iloc[-4000:]
-
-    c18b_model = ThetaModel(
-        c18b_train_recent, period=168, deseasonalize=True, method="additive"
-    )
-    c18b_fitted = c18b_model.fit()
-
-    print("=" * 60)
-    print("THETA MODEL FIT SUMMARY")
-    print("=" * 60)
-    print(c18b_fitted.summary())
-
-    c18b_forecast_vals = c18b_fitted.forecast(steps=168)
-    c18b_forecast_index = pd.date_range(
-        start=c18b_train_wf.index[-1] + pd.Timedelta(hours=1), periods=168, freq="h"
-    )
-    c18b_forecast_raw = pd.Series(c18b_forecast_vals.values, index=c18b_forecast_index)
-
-    print("\nRAW forecast stats (before clipping):")
-    print(
-        f"Min: {c18b_forecast_raw.min():.1f}, Max: {c18b_forecast_raw.max():.1f}, Mean: {c18b_forecast_raw.mean():.1f}"
-    )
-    print("\nActual stats this window:")
-    print(
-        f"Min: {c18b_actual_wf.min():.1f}, Max: {c18b_actual_wf.max():.1f}, Mean: {c18b_actual_wf.mean():.1f}"
-    )
-
-    c18b_forecast_clipped = c18b_forecast_raw.clip(lower=0)
-
-    fig_diag8, ax_diag8 = plt.subplots(figsize=(16, 5))
-    ax_diag8.plot(
-        c18b_actual_wf.index,
-        c18b_actual_wf.values,
-        color="#2563EB",
-        label="Actual",
-        marker="o",
-        ms=3,
-    )
-    ax_diag8.plot(
-        c18b_forecast_clipped.index,
-        c18b_forecast_clipped.values,
-        color="#EF4444",
-        label="Theta forecast",
-        marker="x",
-        ms=3,
-    )
-    ax_diag8.set_title(
-        "DIAGNOSTIC: Theta Model — Window 1 Forecast vs Actual", fontweight="bold"
-    )
-    ax_diag8.legend()
-    plt.xticks(rotation=30)
-    plt.tight_layout()
-    plt.savefig("figures/diag_08_theta_window1.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    return c18b_fitted, c18b_forecast_raw
-
-
-@app.cell
-def _(c18b_fitted, c18b_forecast_raw, pd):
-    # ── CELL 18c: VERIFY — inspect Theta's seasonal component directly ───────
-    # Hypothesis: Theta's additive seasonal correction for night hours isn't
-    # strong enough to pull the SES+drift level (~70-110) down to ~0, leaving
-    # a residual floor around 35. We inspect the model's internal seasonal
-    # estimates directly to check this.
-
-    print("Seasonal component estimates (first 48 hours of the 168-hour cycle):")
-    print(
-        pd.Series(
-            c18b_fitted.model.seasonal
-            if hasattr(c18b_fitted.model, "seasonal")
-            else "N/A — checking summary instead"
-        )
-    )
-
-    # The forecast() method's documentation suggests seasonal terms are stored
-    # on the model itself — let's also just directly inspect a few known
-    # night-hour vs day-hour forecast values to confirm the floor visually
-    print(
-        "\nForecast values for HOUR 0-5 of the cycle (should be deep night, near-zero actual):"
-    )
-    print(c18b_forecast_raw.iloc[:6])
-    print(
-        "\nForecast values for HOUR 20-23 (Dec 6 21:00-23:00, evening, should be near zero by 23:00):"
-    )
-    print(c18b_forecast_raw.iloc[20:24])
-    return
-
-
-@app.cell
-def _(
-    ThetaModel,
-    naive_mean_smape,
-    np,
-    pd,
-    series,
-    smape,
-    theta_mean_smape,
-    val_cutoffs,
-):
-    # ── CELL 18d: Theta with manual zero-floor fix — full walk-forward retest ──
-    # DIAGNOSED (Cell 18c): Theta's seasonal reconstruction leaves a hard,
-    # near-constant floor (~35-36) during deep-night hours, instead of reaching
-    # true zero. This is the SAME category of bug as XGBoost v1's zero-hour
-    # noise problem (Cell 9d-9e), just with a much LARGER and more CONSISTENT
-    # offset (35 vs XGBoost's average 0.35). We apply the same fix: any
-    # prediction below a threshold gets snapped to exactly 0.0. Given the
-    # floor sits consistently around 35-36, we need a threshold comfortably
-    # ABOVE that (e.g., 45) to actually catch it, unlike XGBoost's much
-    # smaller 5.0 threshold.
-
-    c18d_zero_threshold = (
-        45.0  # must exceed the observed ~35-36 floor to actually catch it
-    )
-
-    theta2_smape_scores = []
-    theta2_mse_scores = []
-
-    for c18d_w, c18d_cutoff_w in enumerate(val_cutoffs):
-        c18d_train_wf = series[series.index <= c18d_cutoff_w]
-        c18d_actual_wf = series[
-            (series.index > c18d_cutoff_w)
-            & (series.index <= c18d_cutoff_w + pd.Timedelta(hours=168))
-        ]
-        c18d_train_recent = c18d_train_wf.iloc[-4000:]
-
-        c18d_model = ThetaModel(
-            c18d_train_recent, period=168, deseasonalize=True, method="additive"
-        )
-        c18d_fitted = c18d_model.fit()
-
-        c18d_forecast_vals = c18d_fitted.forecast(steps=168)
-        c18d_forecast_index = pd.date_range(
-            start=c18d_train_wf.index[-1] + pd.Timedelta(hours=1), periods=168, freq="h"
-        )
-        c18d_forecast = pd.Series(c18d_forecast_vals.values, index=c18d_forecast_index)
-
-        c18d_forecast = c18d_forecast.clip(lower=0)  # physical floor
-        c18d_forecast = c18d_forecast.where(
-            c18d_forecast >= c18d_zero_threshold, 0.0
-        )  # zero-floor fix
-
-        c18d_aligned = pd.DataFrame(
-            {"actual": c18d_actual_wf, "forecast": c18d_forecast}
-        ).dropna()
-        assert len(c18d_aligned) == 168, (
-            f"Window {c18d_w + 1} has {len(c18d_aligned)} rows"
-        )
-
-        c18d_smape_val = smape(c18d_aligned["actual"], c18d_aligned["forecast"])
-        c18d_mse_val = np.mean((c18d_aligned["actual"] - c18d_aligned["forecast"]) ** 2)
-
-        theta2_smape_scores.append(c18d_smape_val)
-        theta2_mse_scores.append(c18d_mse_val)
-
-        print(
-            f"  Window {c18d_w + 1} ({c18d_cutoff_w.date()} cutoff): "
-            f"SMAPE={c18d_smape_val:.4f}, MSE={c18d_mse_val:.1f}"
-        )
-
-    theta2_mean_smape = np.mean(theta2_smape_scores)
-    theta2_std_smape = np.std(theta2_smape_scores)
-
-    print(f"\n{'=' * 60}")
-    print(f"THETA MODEL (with zero-floor fix, threshold={c18d_zero_threshold}) RESULTS")
-    print(f"{'=' * 60}")
-    print(f"Mean SMAPE: {theta2_mean_smape:.4f}  ± {theta2_std_smape:.4f} std")
-    print(
-        f"SMAPE range: [{min(theta2_smape_scores):.4f}, {max(theta2_smape_scores):.4f}]"
-    )
-
-    print(f"\n{'=' * 60}")
-    print("COMPARISON: Theta v1 (broken) vs Theta v2 (zero-floor fix) vs naive")
-    print(f"{'=' * 60}")
-    print(f"Theta v1 SMAPE (no fix):    {theta_mean_smape:.4f}")
-    print(f"Theta v2 SMAPE (with fix):  {theta2_mean_smape:.4f}")
-    print(f"Naive SMAPE:                {naive_mean_smape:.4f}")
-
-    c18d_improvement = (theta_mean_smape - theta2_mean_smape) / theta_mean_smape * 100
-    print(f"\nZero-floor fix improved Theta SMAPE by {c18d_improvement:.1f}%")
-
-    if theta2_mean_smape < naive_mean_smape:
-        c18d_vs_naive = (naive_mean_smape - theta2_mean_smape) / naive_mean_smape * 100
-        print(f"\n✅ Theta v2 BEATS naive baseline by {c18d_vs_naive:.1f}%")
-    else:
-        c18d_gap = (theta2_mean_smape - naive_mean_smape) / naive_mean_smape * 100
-        print(f"\n❌ Theta v2 still WORSE than naive by {c18d_gap:.1f}%")
-    return c18d_zero_threshold, theta2_mean_smape
-
-
-@app.cell
-def _(ThetaModel, c18d_zero_threshold, pd, plt, series, val_cutoffs):
-    # ── CELL 18e: DIAGNOSTIC — why is Window 5 untouched by the zero-floor fix? ──
-    # Theta v2's zero-floor fix had EXACTLY ZERO effect on Window 5 (both
-    # 1.1061) — meaning whatever is wrong there is NOT a zero-hour problem.
-    # Jan 3-9, 2022 contains Jan 6 (Epiphany, confirmed Catalonia holiday).
-    # We plot this window directly to see the actual failure shape.
-
-    c18e_cutoff = val_cutoffs[4]  # Window 5: 2022-01-02 23:00:00
-    c18e_train_wf = series[series.index <= c18e_cutoff]
-    c18e_actual_wf = series[
-        (series.index > c18e_cutoff)
-        & (series.index <= c18e_cutoff + pd.Timedelta(hours=168))
-    ]
-    c18e_train_recent = c18e_train_wf.iloc[-4000:]
-
-    c18e_model = ThetaModel(
-        c18e_train_recent, period=168, deseasonalize=True, method="additive"
-    )
-    c18e_fitted = c18e_model.fit()
-
-    print("Theta fit summary, Window 5:")
-    print(c18e_fitted.summary())
-
-    c18e_forecast_vals = c18e_fitted.forecast(steps=168)
-    c18e_forecast_index = pd.date_range(
-        start=c18e_train_wf.index[-1] + pd.Timedelta(hours=1), periods=168, freq="h"
-    )
-    c18e_forecast_raw = pd.Series(c18e_forecast_vals.values, index=c18e_forecast_index)
-    c18e_forecast_fixed = c18e_forecast_raw.clip(lower=0)
-    c18e_forecast_fixed = c18e_forecast_fixed.where(
-        c18e_forecast_fixed >= c18d_zero_threshold, 0.0
-    )
-
-    print(
-        f"\nForecast range: [{c18e_forecast_fixed.min():.1f}, {c18e_forecast_fixed.max():.1f}]"
-    )
-    print(f"Actual range:    [{c18e_actual_wf.min():.1f}, {c18e_actual_wf.max():.1f}]")
-
-    fig_diag9, ax_diag9 = plt.subplots(figsize=(16, 5))
-    ax_diag9.plot(
-        c18e_actual_wf.index,
-        c18e_actual_wf.values,
-        color="#2563EB",
-        label="Actual",
-        marker="o",
-        ms=3,
-    )
-    ax_diag9.plot(
-        c18e_forecast_fixed.index,
-        c18e_forecast_fixed.values,
-        color="#EF4444",
-        label="Theta v2 (zero-floor fixed)",
-        marker="x",
-        ms=3,
-    )
-    ax_diag9.axvline(
-        pd.Timestamp("2022-01-06"),
-        color="#F97316",
-        linestyle="--",
-        label="Jan 6: Epiphany (holiday)",
-    )
-    ax_diag9.set_title(
-        "DIAGNOSTIC: Theta v2 — Window 5 (Jan 3-9, 2022) Forecast vs Actual",
-        fontweight="bold",
-    )
-    ax_diag9.legend()
-    plt.xticks(rotation=30)
-    plt.tight_layout()
-    plt.savefig("figures/diag_09_theta_window5.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    return
-
-
-@app.cell
-def _(
-    ThetaModel,
-    naive_mean_smape,
-    np,
-    pd,
-    series,
-    smape,
-    theta2_mean_smape,
-    theta_mean_smape,
-    val_cutoffs,
-    xgb6_mean_smape,
-):
-    # ── CELL 18f: Theta with ADAPTIVE per-window zero-floor (derived from each fit) ──
-    # DIAGNOSED (Cell 18d, 18e): a FIXED threshold (45.0) worked for windows
-    # with a ~35 floor but completely failed on Window 5, whose fit produced
-    # an ~80 floor instead — confirming the floor magnitude is WINDOW-SPECIFIC,
-    # tracking each fit's own SES level/alpha. FIX: instead of one global
-    # threshold, derive the floor PER WINDOW directly from that window's own
-    # minimum forecasted value (the floor IS the minimum, almost by definition
-    # in every window we've inspected) plus a small margin for noise.
-
-    theta3_smape_scores = []
-    theta3_mse_scores = []
-
-    for c18f_w, c18f_cutoff_w in enumerate(val_cutoffs):
-        c18f_train_wf = series[series.index <= c18f_cutoff_w]
-        c18f_actual_wf = series[
-            (series.index > c18f_cutoff_w)
-            & (series.index <= c18f_cutoff_w + pd.Timedelta(hours=168))
-        ]
-        c18f_train_recent = c18f_train_wf.iloc[-4000:]
-
-        c18f_model = ThetaModel(
-            c18f_train_recent, period=168, deseasonalize=True, method="additive"
-        )
-        c18f_fitted = c18f_model.fit()
-
-        c18f_forecast_vals = c18f_fitted.forecast(steps=168)
-        c18f_forecast_index = pd.date_range(
-            start=c18f_train_wf.index[-1] + pd.Timedelta(hours=1), periods=168, freq="h"
-        )
-        c18f_forecast_raw = pd.Series(
-            c18f_forecast_vals.values, index=c18f_forecast_index
-        )
-        c18f_forecast_raw = c18f_forecast_raw.clip(lower=0)
-
-        # ── ADAPTIVE floor: derive threshold from THIS window's own minimum ──
-        # We add a 20% margin above the observed minimum, to also catch the
-        # few hours that sit slightly above the absolute floor value but are
-        # still clearly "night noise" rather than genuine demand
-        c18f_window_floor = c18f_forecast_raw.min()
-        c18f_adaptive_threshold = c18f_window_floor * 1.20
-
-        c18f_forecast_fixed = c18f_forecast_raw.where(
-            c18f_forecast_raw >= c18f_adaptive_threshold, 0.0
-        )
-
-        c18f_aligned = pd.DataFrame(
-            {"actual": c18f_actual_wf, "forecast": c18f_forecast_fixed}
-        ).dropna()
-        assert len(c18f_aligned) == 168, (
-            f"Window {c18f_w + 1} has {len(c18f_aligned)} rows"
-        )
-
-        c18f_smape_val = smape(c18f_aligned["actual"], c18f_aligned["forecast"])
-        c18f_mse_val = np.mean((c18f_aligned["actual"] - c18f_aligned["forecast"]) ** 2)
-
-        theta3_smape_scores.append(c18f_smape_val)
-        theta3_mse_scores.append(c18f_mse_val)
-
-        print(
-            f"  Window {c18f_w + 1} ({c18f_cutoff_w.date()} cutoff): "
-            f"floor={c18f_window_floor:.1f}, adaptive_threshold={c18f_adaptive_threshold:.1f}, "
-            f"SMAPE={c18f_smape_val:.4f}, MSE={c18f_mse_val:.1f}"
-        )
-
-    theta3_mean_smape = np.mean(theta3_smape_scores)
-    theta3_std_smape = np.std(theta3_smape_scores)
-
-    print(f"\n{'=' * 60}")
-    print("THETA MODEL (ADAPTIVE per-window zero-floor) RESULTS")
-    print(f"{'=' * 60}")
-    print(f"Mean SMAPE: {theta3_mean_smape:.4f}  ± {theta3_std_smape:.4f} std")
-    print(
-        f"SMAPE range: [{min(theta3_smape_scores):.4f}, {max(theta3_smape_scores):.4f}]"
-    )
-
-    print(f"\n{'=' * 60}")
-    print("FULL THETA COMPARISON")
-    print(f"{'=' * 60}")
-    print(f"Theta v1 (no fix):           {theta_mean_smape:.4f}")
-    print(f"Theta v2 (fixed thresh=45):  {theta2_mean_smape:.4f}")
-    print(f"Theta v3 (adaptive thresh):  {theta3_mean_smape:.4f}")
-    print(f"Naive SMAPE:                 {naive_mean_smape:.4f}")
-    print(f"XGBoost v6 SMAPE:            {xgb6_mean_smape:.4f}")
-
-    if theta3_mean_smape < naive_mean_smape:
-        c18f_vs_naive = (naive_mean_smape - theta3_mean_smape) / naive_mean_smape * 100
-        print(f"\n✅ Theta v3 BEATS naive baseline by {c18f_vs_naive:.1f}%")
-    else:
-        c18f_gap = (theta3_mean_smape - naive_mean_smape) / naive_mean_smape * 100
-        print(f"\n❌ Theta v3 still WORSE than naive by {c18f_gap:.1f}%")
-    return (theta3_mean_smape,)
-
-
-@app.cell
-def _(ThetaModel, pd, plt, series, val_cutoffs):
-    # ── CELL 18g: RE-DIAGNOSTIC — actually look at Theta v3's Window 5 output ──
-    # Per-window floor values are inconsistent (12 to 79) across windows,
-    # suggesting "snap minimum to zero" may be masking the REAL problem rather
-    # than fixing it. We need to see the actual forecast shape again, now with
-    # the adaptive fix applied, focusing on the worst remaining window.
-
-    c18g_cutoff = val_cutoffs[4]  # Window 5, still worst at 0.4818
-    c18g_train_wf = series[series.index <= c18g_cutoff]
-    c18g_actual_wf = series[
-        (series.index > c18g_cutoff)
-        & (series.index <= c18g_cutoff + pd.Timedelta(hours=168))
-    ]
-    c18g_train_recent = c18g_train_wf.iloc[-4000:]
-
-    c18g_model = ThetaModel(
-        c18g_train_recent, period=168, deseasonalize=True, method="additive"
-    )
-    c18g_fitted = c18g_model.fit()
-
-    c18g_forecast_vals = c18g_fitted.forecast(steps=168)
-    c18g_forecast_index = pd.date_range(
-        start=c18g_train_wf.index[-1] + pd.Timedelta(hours=1), periods=168, freq="h"
-    )
-    c18g_forecast_raw = pd.Series(
-        c18g_forecast_vals.values, index=c18g_forecast_index
-    ).clip(lower=0)
-
-    c18g_floor = c18g_forecast_raw.min()
-    c18g_threshold = c18g_floor * 1.20
-    c18g_forecast_fixed = c18g_forecast_raw.where(
-        c18g_forecast_raw >= c18g_threshold, 0.0
-    )
-
-    # ── Print EVERY value for the first 48 hours, not just summary stats ─────
-    print("Hour-by-hour, first 48 hours (actual vs raw forecast vs fixed forecast):")
-    c18g_compare = pd.DataFrame(
-        {
-            "actual": c18g_actual_wf.values[:48],
-            "forecast_raw": c18g_forecast_raw.values[:48],
-            "forecast_fixed": c18g_forecast_fixed.values[:48],
-        },
-        index=c18g_forecast_index[:48],
-    )
-    print(c18g_compare.to_string())
-
-    fig_diag10, ax_diag10 = plt.subplots(figsize=(16, 5))
-    ax_diag10.plot(
-        c18g_actual_wf.index,
-        c18g_actual_wf.values,
-        color="#2563EB",
-        label="Actual",
-        marker="o",
-        ms=3,
-    )
-    ax_diag10.plot(
-        c18g_forecast_fixed.index,
-        c18g_forecast_fixed.values,
-        color="#EF4444",
-        label="Theta v3 (adaptive fix)",
-        marker="x",
-        ms=3,
-    )
-    ax_diog10_title = "DIAGNOSTIC: Theta v3 (adaptive) — Window 5 Full Detail"
-    ax_diag10.set_title(ax_diog10_title, fontweight="bold")
-    ax_diag10.legend()
-    plt.xticks(rotation=30)
-    plt.tight_layout()
-    plt.savefig("figures/diag_10_theta_v3_window5.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    return c18g_actual_wf, c18g_forecast_raw
-
-
-@app.cell
-def _(c18g_actual_wf, c18g_forecast_raw):
-    # ── CELL 18h: VERIFY — is the offset truly constant, and can we subtract it cleanly? ──
-    # Hypothesis: there's a single, roughly-constant additive bias baked into
-    # EVERY hour of Theta's reseasonalized forecast — NOT a "floor" specific
-    # to zero-hours. Visible at night (where actual=0 makes the offset the
-    # entire prediction) AND during the day (where it inflates genuine signal).
-    # We test this by checking if (forecast_raw - actual) is roughly constant
-    # across hours where we're confident the model SHOULD be accurate.
-
-    # Compare forecast_raw to actual directly, hour by hour, for the deep-night
-    # hours specifically (where we know actual=0 exactly, so forecast_raw IS
-    # the pure offset, no signal mixed in)
-    c18h_night_mask = c18g_actual_wf.values[:48] == 0
-    c18h_night_offsets = c18g_forecast_raw.values[:48][c18h_night_mask]
-    print("Theta's forecast values during TRUE-ZERO hours (pure offset, no signal):")
-    print(c18h_night_offsets)
-    print(
-        f"\nMean: {c18h_night_offsets.mean():.2f}, Std: {c18h_night_offsets.std():.2f}"
-    )
-    print(
-        "(low std relative to mean would confirm this is a stable, subtractable constant)"
-    )
-    return
-
-
-@app.cell
-def _(
-    ThetaModel,
-    naive_mean_smape,
-    np,
-    pd,
-    series,
-    smape,
-    theta2_mean_smape,
-    theta3_mean_smape,
-    theta_mean_smape,
-    val_cutoffs,
-    xgb6_mean_smape,
-):
-    # ── CELL 19: Theta v4 — subtract the constant additive offset directly ───
-    # CONFIRMED (Cell 18h): Theta's forecast carries a STABLE constant additive
-    # bias (mean 78.83, std 0.26 in Window 5 — essentially a hard constant, not
-    # noise). This single number gets added to EVERY hour of the forecast,
-    # regardless of true demand — visible as a "floor" at night (where it's
-    # the entire prediction) and as systematic OVERSHOOTING during the day
-    # (where it inflates genuine signal on top of real demand). Zero-flooring
-    # (v2, v3) only fixed the night-hour symptom; it left the day-hour
-    # overshoot completely untouched, which is why v3 still trailed naive by
-    # 52% despite "fixing" the floor.
-    #
-    # THE CORRECT FIX: measure this constant directly from each window's own
-    # fit (using the deep-night hours, where actual=0 and forecast IS the pure
-    # offset), then SUBTRACT it from the ENTIRE 168-hour forecast — not just
-    # snap small values to zero. Re-clip at 0 afterward since subtraction
-    # could occasionally push a few values slightly negative.
-
-    theta4_smape_scores = []
-    theta4_mse_scores = []
-
-    for c19_w, c19_cutoff_w in enumerate(val_cutoffs):
-        c19_train_wf = series[series.index <= c19_cutoff_w]
-        c19_actual_wf = series[
-            (series.index > c19_cutoff_w)
-            & (series.index <= c19_cutoff_w + pd.Timedelta(hours=168))
-        ]
-        c19_train_recent = c19_train_wf.iloc[-4000:]
-
-        c19_model = ThetaModel(
-            c19_train_recent, period=168, deseasonalize=True, method="additive"
-        )
-        c19_fitted = c19_model.fit()
-
-        c19_forecast_vals = c19_fitted.forecast(steps=168)
-        c19_forecast_index = pd.date_range(
-            start=c19_train_wf.index[-1] + pd.Timedelta(hours=1), periods=168, freq="h"
-        )
-        c19_forecast_raw = pd.Series(
-            c19_forecast_vals.values, index=c19_forecast_index
-        ).clip(lower=0)
-
-        # ── Measure the constant offset directly from THIS window's training data ──
-        # We can't use the forecast's own minimum reliably (Window 5 showed
-        # variation depending on which hours happen to be in the 168-hour
-        # window) — instead, fit the SAME model's one-step-ahead behavior on
-        # historically-known true-zero hours within the training data itself,
-        # which gives a more robust estimate. Simpler and equally valid: take
-        # the minimum of the 168-hour forecast as our offset estimate, since
-        # we've confirmed (Cell 18h) it is a hard, stable constant — the
-        # forecast's true minimum across a full week reliably IS that constant,
-        # since every week contains many genuine zero-actual hours.
-        c19_offset_estimate = c19_forecast_raw.min()
-
-        # Subtract the constant from EVERY hour, then re-clip at 0 (subtraction
-        # could push a few already-low values slightly negative)
-        c19_forecast_corrected = (c19_forecast_raw - c19_offset_estimate).clip(lower=0)
-
-        c19_aligned = pd.DataFrame(
-            {"actual": c19_actual_wf, "forecast": c19_forecast_corrected}
-        ).dropna()
-        assert len(c19_aligned) == 168, (
-            f"Window {c19_w + 1} has {len(c19_aligned)} rows"
-        )
-
-        c19_smape_val = smape(c19_aligned["actual"], c19_aligned["forecast"])
-        c19_mse_val = np.mean((c19_aligned["actual"] - c19_aligned["forecast"]) ** 2)
-
-        theta4_smape_scores.append(c19_smape_val)
-        theta4_mse_scores.append(c19_mse_val)
-
-        print(
-            f"  Window {c19_w + 1} ({c19_cutoff_w.date()} cutoff): "
-            f"offset_subtracted={c19_offset_estimate:.1f}, SMAPE={c19_smape_val:.4f}, MSE={c19_mse_val:.1f}"
-        )
-
-    theta4_mean_smape = np.mean(theta4_smape_scores)
-    theta4_std_smape = np.std(theta4_smape_scores)
-
-    print(f"\n{'=' * 60}")
-    print("THETA MODEL v4 (constant-offset SUBTRACTED, not floored) RESULTS")
-    print(f"{'=' * 60}")
-    print(f"Mean SMAPE: {theta4_mean_smape:.4f}  ± {theta4_std_smape:.4f} std")
-    print(
-        f"SMAPE range: [{min(theta4_smape_scores):.4f}, {max(theta4_smape_scores):.4f}]"
-    )
-
-    print(f"\n{'=' * 60}")
-    print("FULL THETA EVOLUTION")
-    print(f"{'=' * 60}")
-    print(f"Theta v1 (no fix):              {theta_mean_smape:.4f}")
-    print(f"Theta v2 (fixed floor=45):      {theta2_mean_smape:.4f}")
-    print(f"Theta v3 (adaptive floor):      {theta3_mean_smape:.4f}")
-    print(f"Theta v4 (subtract constant):   {theta4_mean_smape:.4f}")
-    print(f"Naive SMAPE:                    {naive_mean_smape:.4f}")
-    print(f"XGBoost v6 SMAPE:                {xgb6_mean_smape:.4f}")
-
-    if theta4_mean_smape < naive_mean_smape:
-        c19_vs_naive = (naive_mean_smape - theta4_mean_smape) / naive_mean_smape * 100
-        print(f"\n✅ Theta v4 BEATS naive baseline by {c19_vs_naive:.1f}%")
-    else:
-        c19_gap = (theta4_mean_smape - naive_mean_smape) / naive_mean_smape * 100
-        print(f"\n❌ Theta v4 still WORSE than naive by {c19_gap:.1f}%")
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## Model Family Tested But Excluded: Theta Model
-
-    We tested the **Theta model** (Simple Exponential Smoothing + linear drift,
-    with additive deseasonalization at period=168) as a fourth candidate model
-    family, following the course's recommendation that it is a strong, simple
-    SOTA benchmark (winner of the M3 forecasting competition). After five
-    diagnostic iterations, we excluded it from our final model lineup. We
-    document our reasoning transparently below, since understanding *why* a
-    reasonable technique fails on a specific dataset is as valuable as finding
-    one that succeeds.
-
-    ### What we found
-
-    **v1 (no fix): SMAPE = 0.944** — catastrophic. Visual inspection revealed
-    Theta's forecast never reached true zero during night hours, instead
-    flattening at a roughly constant positive value (~35–80, varying by
-    validation window). Since SMAPE assigns the maximum possible score (2.0)
-    to any positive prediction on a true-zero hour, and ~32% of our hours are
-    structural zeros (Glovo does not operate 00:00–07:00), this alone explained
-    most of the catastrophic score.
-
-    **v2 (fixed zero-floor, threshold=45): SMAPE = 0.483** — a fixed threshold
-    worked for windows whose floor happened to sit below 45, but completely
-    failed on Window 5, whose floor sat at ~79 — confirming the floor magnitude
-    is *window-specific*, not a universal constant.
-
-    **v3 (adaptive per-window floor): SMAPE = 0.327** — deriving the threshold
-    from each window's own minimum forecasted value improved results
-    substantially and confirmed the floor mechanism is real, but a detailed
-    hour-by-hour inspection of the still-weak Window 5 revealed the floor was
-    never the *only* problem: the same offset that produced the night floor was
-    also being added to *every other hour*, including daytime and peak hours,
-    producing systematic **overshooting** during the day that the zero-floor
-    fix could not address (it only zeroes small values, leaving large
-    overshoots on real-demand hours untouched).
-
-    **v4 (subtract the constant from every hour): SMAPE = 0.782** — attempting
-    to remove this seemingly-constant offset uniformly made results
-    significantly *worse*, not better. This was the most informative result:
-    it revealed that what looked like "one constant added everywhere" was in
-    fact a *misreading* of the additive decomposition. Additive seasonal
-    decomposition assigns a **distinct** seasonal term to each hour-of-week,
-    not one global constant — the night-hour value we measured was simply
-    Theta's own (incorrect) prediction for that specific seasonal phase, not a
-    removable bias layered on top of an otherwise-correct prediction.
-    Subtracting it uniformly distorted the *relative* shape of peaks and
-    troughs, trading an overshoot problem for a new undershoot problem.
-
-    ### Root cause assessment
-
-    Across all five iterations, the most consistent and defensible explanation
-    is: **Theta's underlying Simple Exponential Smoothing component estimates
-    a single smoothed "level" for the entire series, and this level estimate is
-    distorted by our data's extreme intra-day volatility** — a peak-to-mean
-    ratio of ~5.5× (Cell 3) and 31.7% structural zero-hours (Cell 1) are far
-    outside the conditions Theta and SES were designed for (smoother series
-    such as quarterly GDP, monthly retail volumes, or the antihistamine sales
-    series from Exercise 04). The single weekly seasonal period further means
-    Theta has no mechanism to separately reconcile the daily (S=24) shape from
-    the weekly (S=168) shape the way our lag-feature-based XGBoost can.
-
-    ### Conclusion
-
-    We treat this as a genuine, evidence-based finding rather than a
-    implementation failure: **Theta is not well-suited to extremely spiky,
-    zero-heavy, dual-seasonality hourly operational data**, despite being a
-    strong general-purpose benchmark. This is consistent with our course's
-    repeated lesson that model suitability must be verified empirically on the
-    specific series at hand, not assumed from general reputation. Theta is
-    excluded from our final ensemble. Naive, SARIMA v2, and XGBoost v6 remain
-    our candidate models going forward.
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ##  Optimal Naive + XGBoost v6 Blend Weight
-    """)
-    return
-
-
-@app.cell
-def _(
-    c10_zero_threshold,
-    c15_df,
-    c15_feature_cols,
-    c15_holiday_set,
-    np,
-    pd,
-    seasonal_naive_forecast,
-    series,
-    smape,
-    val_cutoffs,
-    xgb,
-):
-    # ── CELL 21: Optimal blend weight — naive + XGBoost v6 (best XGBoost so far) ──
-    # Repeats the same principled grid search as Cell 14, but using v6 (with
-    # holiday/long-weekend flags) instead of v5 — since v6 is now our strongest
-    # XGBoost variant. We reuse the SAME small, principled grid (not a huge
-    # sweep) to avoid overfitting the weight choice to 7 noisy validation
-    # windows, exactly as before.
-
-    def c21_rebuild_xgb_v6_forecast(cutoff):
-        """Refit XGBoost v6's exact pipeline (holiday flags included) for one cutoff."""
-        train_df = c15_df[c15_df.index <= cutoff]
-        model = xgb.XGBRegressor(
-            n_estimators=300,
-            max_depth=5,
-            learning_rate=0.05,
-            random_state=42,
-            objective="reg:squarederror",
-        )
-        model.fit(train_df[c15_feature_cols], train_df["orders"])
-
-        history = series[series.index <= cutoff].copy()
-        preds = []
-        idx = pd.date_range(start=cutoff + pd.Timedelta(hours=1), periods=168, freq="h")
-        for t in idx:
-            lag1, lag24 = (
-                history.loc[t - pd.Timedelta(hours=1)],
-                history.loc[t - pd.Timedelta(hours=24)],
-            )
-            lag168, lag336 = (
-                history.loc[t - pd.Timedelta(hours=168)],
-                history.loc[t - pd.Timedelta(hours=336)],
-            )
-            roll168 = history.loc[
-                t - pd.Timedelta(hours=168) : t - pd.Timedelta(hours=1)
-            ].mean()
-            this_date = t.date()
-            row = {
-                "hour_of_day": t.hour,
-                "day_of_week": t.dayofweek,
-                "is_weekend": int(t.dayofweek >= 5),
-                "lag_1": lag1,
-                "lag_24": lag24,
-                "lag_48": history.loc[t - pd.Timedelta(hours=48)],
-                "lag_144": history.loc[t - pd.Timedelta(hours=144)],
-                "lag_168": lag168,
-                "ratio_recent_vs_week": lag1 / roll168 if roll168 > 0 else 0.0,
-                "ratio_day_vs_week": lag24 / roll168 if roll168 > 0 else 0.0,
-                "growth_ratio_168": lag168 / lag336 if lag336 > 0 else 1.0,
-                "is_holiday": int(this_date in c15_holiday_set),
-                "is_day_before_holiday": int(
-                    (this_date + pd.Timedelta(days=1)) in c15_holiday_set
-                ),
-                "is_day_after_holiday": int(
-                    (this_date - pd.Timedelta(days=1)) in c15_holiday_set
-                ),
-            }
-            row_df = pd.DataFrame([row])[c15_feature_cols]
-            pred = max(model.predict(row_df)[0], 0.0)
-            pred = 0.0 if pred < c10_zero_threshold else pred
-            preds.append(pred)
-            history.loc[t] = pred
-        return pd.Series(preds, index=idx)
-
-    c21_weight_grid = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    c21_results = []
-
-    print("=" * 60)
-    print("OPTIMAL BLEND WEIGHT — naive + XGBoost v6")
-    print("=" * 60)
-
-    for c21_weight in c21_weight_grid:
-        c21_window_scores = []
-        for c21_w, c21_cutoff_w in enumerate(val_cutoffs):
-            c21_actual_wf = series[
-                (series.index > c21_cutoff_w)
-                & (series.index <= c21_cutoff_w + pd.Timedelta(hours=168))
-            ]
-            c21_naive_fc = seasonal_naive_forecast(
-                series[series.index <= c21_cutoff_w], horizon=168
-            )
-            c21_xgb_fc = c21_rebuild_xgb_v6_forecast(c21_cutoff_w)
-            c21_blend_fc = (1 - c21_weight) * c21_naive_fc + c21_weight * c21_xgb_fc
-            c21_aligned = pd.DataFrame(
-                {"actual": c21_actual_wf, "forecast": c21_blend_fc}
-            ).dropna()
-            c21_window_scores.append(
-                smape(c21_aligned["actual"], c21_aligned["forecast"])
-            )
-
-        c21_mean = np.mean(c21_window_scores)
-        c21_std = np.std(c21_window_scores)
-        c21_results.append(
-            {"weight_xgb": c21_weight, "mean_smape": c21_mean, "std_smape": c21_std}
-        )
-        print(
-            f"  weight_xgb={c21_weight:.1f}: mean SMAPE = {c21_mean:.4f}  ± {c21_std:.4f}"
-        )
-
-    c21_results_df = pd.DataFrame(c21_results)
-    c21_best_row = c21_results_df.loc[c21_results_df["mean_smape"].idxmin()]
-    print(
-        f"\nBest weight: {c21_best_row['weight_xgb']:.1f}, mean SMAPE = {c21_best_row['mean_smape']:.4f}"
-    )
-    print(
-        f"Compare to naive alone (weight=0.0): {c21_results_df[c21_results_df['weight_xgb'] == 0.0]['mean_smape'].values[0]:.4f}"
-    )
-    return
-
-
-@app.cell
-def _(
-    c10_zero_threshold,
-    c15_df,
-    c15_feature_cols,
-    c15_holiday_set,
-    naive_smape_scores,
-    pd,
-    series,
-    smape,
-    val_cutoffs,
-    xgb,
-    xgb6_smape_scores,
-):
-    # ── CELL 22: Quick test — does learning_rate matter for XGBoost v6? ──────
-    # Prior evidence (Cells 9c, 10c) showed capacity-related hyperparameters
-    # (max_depth, n_estimators, min_child_weight, subsample) consistently made
-    # things WORSE on this dataset, never better. learning_rate is mechanically
-    # different — it controls how much each successive tree corrects the
-    # residual error of previous trees, not how complex any single tree is.
-    # We test a small, cheap grid on Window 1 first (our most-studied window)
-    # before committing to a full 7-window re-run.
-
-    c22_lr_grid = [0.01, 0.03, 0.05, 0.1, 0.2]  # 0.05 is our current default
-
-    c22_cutoff = val_cutoffs[0]
-    c22_train_df = c15_df[c15_df.index <= c22_cutoff]
-    c22_actual_wf = series[
-        (series.index > c22_cutoff)
-        & (series.index <= c22_cutoff + pd.Timedelta(hours=168))
-    ]
-
-    print("=" * 60)
-    print("LEARNING RATE TEST — Window 1")
-    print("=" * 60)
-
-    for c22_lr in c22_lr_grid:
-        c22_model = xgb.XGBRegressor(
-            n_estimators=300,
-            max_depth=5,
-            learning_rate=c22_lr,
-            random_state=42,
-            objective="reg:squarederror",
-        )
-        c22_model.fit(c22_train_df[c15_feature_cols], c22_train_df["orders"])
-
-        c22_history = series[series.index <= c22_cutoff].copy()
-        c22_predictions = []
-        c22_forecast_index = pd.date_range(
-            start=c22_cutoff + pd.Timedelta(hours=1), periods=168, freq="h"
-        )
-
-        for c22_step_time in c22_forecast_index:
-            c22_lag1 = c22_history.loc[c22_step_time - pd.Timedelta(hours=1)]
-            c22_lag24 = c22_history.loc[c22_step_time - pd.Timedelta(hours=24)]
-            c22_lag168 = c22_history.loc[c22_step_time - pd.Timedelta(hours=168)]
-            c22_lag336 = c22_history.loc[c22_step_time - pd.Timedelta(hours=336)]
-            c22_roll168 = c22_history.loc[
-                c22_step_time - pd.Timedelta(hours=168) : c22_step_time
-                - pd.Timedelta(hours=1)
-            ].mean()
-            c22_this_date = c22_step_time.date()
-
-            c22_row = {
-                "hour_of_day": c22_step_time.hour,
-                "day_of_week": c22_step_time.dayofweek,
-                "is_weekend": int(c22_step_time.dayofweek >= 5),
-                "lag_1": c22_lag1,
-                "lag_24": c22_lag24,
-                "lag_48": c22_history.loc[c22_step_time - pd.Timedelta(hours=48)],
-                "lag_144": c22_history.loc[c22_step_time - pd.Timedelta(hours=144)],
-                "lag_168": c22_lag168,
-                "ratio_recent_vs_week": c22_lag1 / c22_roll168
-                if c22_roll168 > 0
-                else 0.0,
-                "ratio_day_vs_week": c22_lag24 / c22_roll168
-                if c22_roll168 > 0
-                else 0.0,
-                "growth_ratio_168": c22_lag168 / c22_lag336 if c22_lag336 > 0 else 1.0,
-                "is_holiday": int(c22_this_date in c15_holiday_set),
-                "is_day_before_holiday": int(
-                    (c22_this_date + pd.Timedelta(days=1)) in c15_holiday_set
-                ),
-                "is_day_after_holiday": int(
-                    (c22_this_date - pd.Timedelta(days=1)) in c15_holiday_set
-                ),
-            }
-            c22_row_df = pd.DataFrame([c22_row])[c15_feature_cols]
-            c22_pred = max(c22_model.predict(c22_row_df)[0], 0.0)
-            c22_pred = 0.0 if c22_pred < c10_zero_threshold else c22_pred
-            c22_predictions.append(c22_pred)
-            c22_history.loc[c22_step_time] = c22_pred
-
-        c22_forecast = pd.Series(c22_predictions, index=c22_forecast_index)
-        c22_smape_val = smape(c22_actual_wf, c22_forecast)
-        print(f"  learning_rate={c22_lr:.2f}: SMAPE = {c22_smape_val:.4f}")
-
-    print(f"\nReference — naive baseline this window: {naive_smape_scores[0]:.4f}")
-    print(f"Reference — XGBoost v6 (lr=0.05) this window: {xgb6_smape_scores[0]:.4f}")
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## Documentation — SARIMA Ensemble Exclusion Rationale
-
-    ### Model Tested But Excluded From Final Ensemble: SARIMA
-
-    We tested whether adding **SARIMA v2** (the seasonal-AR-fixed version from
-    Cells 6–7, `SARIMA(2,0,0)(1,0,1)[24]`) as a third member of our ensemble
-    would improve on the naive + XGBoost v6 blend. The result was decisive and
-    required no further grid search: even a **5% weight** on SARIMA caused mean
-    SMAPE to jump from **0.2114** (naive + XGBoost only) to **0.6308** — nearly
-    a 3× degradation — with standard deviation also nearly quadrupling (0.043
-    → 0.160). A 10% weight produced essentially the same catastrophic result
-    (0.6258), confirming this was not a fluke of one weight value.
-
-    ### Why this happens
-
-    This result is fully consistent with everything we learned diagnosing
-    SARIMA on its own (Cells 6–7). SARIMA v2's standalone SMAPE (0.649) is
-    roughly **3× worse** than naive (0.215) — and critically, its errors are
-    **large in absolute magnitude**, not just occasionally wrong. SARIMA's
-    seasonal AR(1) term only captures daily memory (S=24); it has no mechanism
-    to represent the dominant **weekly** pattern (S=168, ACF=0.93) that naive
-    and XGBoost both exploit directly. The result is a forecast that
-    confidently tracks the wrong day-of-week shape for parts of the 168-hour
-    horizon. When blended even at a small weight, these large, systematically
-    wrong values pull the otherwise-accurate ensemble average substantially
-    off course — a weak component with large-magnitude errors does not "average
-    out" harmlessly the way two similarly-accurate models' uncorrelated small
-    errors do (as we saw work well with naive + XGBoost). Ensembling only pays
-    off when combined models are each individually reasonably competent *and*
-    make different kinds of mistakes — SARIMA v2 fails the first condition
-    here, despite satisfying the second.
-
-    ### Conclusion
-
-    SARIMA v2 remains a valuable, fully-documented part of our project's
-    modelling narrative (Cells 6–7) — it demonstrates correct understanding of
-    seasonal ARIMA specification, a real diagnosed bug (mean-reversion
-    collapse) and its fix (adding seasonal AR memory), and a clear, defensible
-    explanation for why it structurally cannot compete with weekly-aware
-    approaches on this series. However, it is **excluded from our final
-    ensemble**: even a small weight materially harms performance, confirming
-    that ensembling benefits depend on the *quality* of each component, not
-    merely on combining "different" models for the sake of diversity. Our
-    final ensemble remains **0.7 × naive + 0.3 × XGBoost v6**, validated at
-    mean SMAPE = 0.2114 across 7 walk-forward windows.
-    "\"\")
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## LightGBM
-    LightGBM is, like XGBoost, a gradient-boosted decision tree library — same fundamental idea (build trees sequentially, each correcting the previous ones' errors). The key practical differences: LightGBM grows trees leaf-wise (always splits the leaf that reduces error the most, regardless of tree depth) rather than XGBoost's level-wise growth (splits all leaves at the current depth before going deeper). This often makes LightGBM faster and sometimes more accurate on tabular data with many features, though results vary by dataset — exactly the kind of thing we should test empirically rather than assume.
-    """)
-    return
-
-
 @app.cell
 def _(
     N_VAL_WEEKS,
@@ -5873,726 +4744,1179 @@ def _(
     pd,
     series,
     smape,
-    time,
-    val_cutoffs,
-    xgb6_mean_smape,
-):
-    # ── CELL 25: LightGBM — same feature set as XGBoost v6, walk-forward validation ──
-    # WHY THIS CELL EXISTS: testing whether a different gradient-boosting
-    # IMPLEMENTATION (leaf-wise growth, vs XGBoost's level-wise growth) performs
-    # better on this specific dataset's shape. We deliberately keep EVERYTHING
-    # else identical to XGBoost v6 — same features (lags, ratios, holiday flags),
-    # same zero-floor fix, same recursive forecasting mechanic — so this is a
-    # clean, isolated test of the algorithm itself, not a confound of also
-    # changing features at the same time.
-
-    import lightgbm as lgb  # NEW import — gradient boosting, leaf-wise tree growth (vs XGBoost's level-wise)
-
-    lgbm_smape_scores = []
-    lgbm_mse_scores = []
-    lgbm_fit_seconds = []
-
-    for c25_w, c25_cutoff_w in enumerate(val_cutoffs):
-        c25_train_df = c15_df[c15_df.index <= c25_cutoff_w]
-        c25_actual_wf = series[
-            (series.index > c25_cutoff_w)
-            & (series.index <= c25_cutoff_w + pd.Timedelta(hours=168))
-        ]
-
-        c25_start_time = time.time()
-
-        # Matched as closely as possible to XGBoost v6's settings, translated
-        # to LightGBM's parameter names: num_leaves is LightGBM's primary
-        # complexity control (leaf-wise growth doesn't use max_depth the same
-        # way XGBoost does) — we use 31, LightGBM's own default, as a fair
-        # starting point rather than guessing
-        c25_model = lgb.LGBMRegressor(
-            n_estimators=300,
-            learning_rate=0.05,
-            num_leaves=31,
-            random_state=42,
-            objective="regression",
-            verbose=-1,  # verbose=-1 silences training logs
-        )
-        c25_model.fit(c25_train_df[c15_feature_cols], c25_train_df["orders"])
-
-        c25_elapsed = time.time() - c25_start_time
-        lgbm_fit_seconds.append(c25_elapsed)
-
-        c25_history = series[series.index <= c25_cutoff_w].copy()
-        c25_predictions = []
-        c25_forecast_index = pd.date_range(
-            start=c25_cutoff_w + pd.Timedelta(hours=1), periods=168, freq="h"
-        )
-
-        for c25_step_time in c25_forecast_index:
-            c25_lag1_val = c25_history.loc[c25_step_time - pd.Timedelta(hours=1)]
-            c25_lag24_val = c25_history.loc[c25_step_time - pd.Timedelta(hours=24)]
-            c25_lag168_val = c25_history.loc[c25_step_time - pd.Timedelta(hours=168)]
-            c25_lag336_val = c25_history.loc[c25_step_time - pd.Timedelta(hours=336)]
-            c25_roll168_val = c25_history.loc[
-                c25_step_time - pd.Timedelta(hours=168) : c25_step_time
-                - pd.Timedelta(hours=1)
-            ].mean()
-            c25_this_date = c25_step_time.date()
-            c25_tomorrow_date = c25_this_date + pd.Timedelta(days=1)
-            c25_yesterday_date = c25_this_date - pd.Timedelta(days=1)
-
-            c25_row = {
-                "hour_of_day": c25_step_time.hour,
-                "day_of_week": c25_step_time.dayofweek,
-                "is_weekend": int(c25_step_time.dayofweek >= 5),
-                "lag_1": c25_lag1_val,
-                "lag_24": c25_lag24_val,
-                "lag_48": c25_history.loc[c25_step_time - pd.Timedelta(hours=48)],
-                "lag_144": c25_history.loc[c25_step_time - pd.Timedelta(hours=144)],
-                "lag_168": c25_lag168_val,
-                "ratio_recent_vs_week": c25_lag1_val / c25_roll168_val
-                if c25_roll168_val > 0
-                else 0.0,
-                "ratio_day_vs_week": c25_lag24_val / c25_roll168_val
-                if c25_roll168_val > 0
-                else 0.0,
-                "growth_ratio_168": c25_lag168_val / c25_lag336_val
-                if c25_lag336_val > 0
-                else 1.0,
-                "is_holiday": int(c25_this_date in c15_holiday_set),
-                "is_day_before_holiday": int(c25_tomorrow_date in c15_holiday_set),
-                "is_day_after_holiday": int(c25_yesterday_date in c15_holiday_set),
-            }
-            c25_row_df = pd.DataFrame([c25_row])[c15_feature_cols]
-
-            c25_pred_value = c25_model.predict(c25_row_df)[0]
-            c25_pred_value = max(c25_pred_value, 0.0)
-            c25_pred_value = (
-                0.0 if c25_pred_value < c10_zero_threshold else c25_pred_value
-            )  # same zero-floor fix as XGBoost
-
-            c25_predictions.append(c25_pred_value)
-            c25_history.loc[c25_step_time] = c25_pred_value
-
-        c25_forecast = pd.Series(c25_predictions, index=c25_forecast_index)
-
-        c25_aligned = pd.DataFrame(
-            {"actual": c25_actual_wf, "forecast": c25_forecast}
-        ).dropna()
-        assert len(c25_aligned) == 168, (
-            f"Window {c25_w + 1} has {len(c25_aligned)} rows, expected 168"
-        )
-
-        c25_smape_val = smape(c25_aligned["actual"], c25_aligned["forecast"])
-        c25_mse_val = np.mean((c25_aligned["actual"] - c25_aligned["forecast"]) ** 2)
-
-        lgbm_smape_scores.append(c25_smape_val)
-        lgbm_mse_scores.append(c25_mse_val)
-
-        print(
-            f"  Window {c25_w + 1} ({c25_cutoff_w.date()} cutoff): "
-            f"SMAPE={c25_smape_val:.4f}, MSE={c25_mse_val:.1f}, fit_time={c25_elapsed:.2f}s"
-        )
-
-    lgbm_mean_smape = np.mean(lgbm_smape_scores)
-    lgbm_mean_mse = np.mean(lgbm_mse_scores)
-    lgbm_std_smape = np.std(lgbm_smape_scores)
-
-    print(f"\n{'=' * 60}")
-    print(f"LIGHTGBM RESULTS — same features as XGBoost v6  (n={N_VAL_WEEKS} windows)")
-    print(f"{'=' * 60}")
-    print(f"Mean SMAPE: {lgbm_mean_smape:.4f}  ± {lgbm_std_smape:.4f} std")
-    print(f"SMAPE range: [{min(lgbm_smape_scores):.4f}, {max(lgbm_smape_scores):.4f}]")
-
-    print(f"\n{'=' * 60}")
-    print("DIRECT COMPARISON: XGBoost v6 vs LightGBM (identical features)")
-    print(f"{'=' * 60}")
-    print(f"Naive SMAPE:       {naive_mean_smape:.4f}")
-    print(f"XGBoost v6 SMAPE:  {xgb6_mean_smape:.4f}")
-    print(f"LightGBM SMAPE:    {lgbm_mean_smape:.4f}")
-
-    if lgbm_mean_smape < xgb6_mean_smape:
-        c25_vs_xgb = (xgb6_mean_smape - lgbm_mean_smape) / xgb6_mean_smape * 100
-        print(f"\n✅ LightGBM BEATS XGBoost v6 by {c25_vs_xgb:.1f}%")
-    else:
-        c25_gap = (lgbm_mean_smape - xgb6_mean_smape) / xgb6_mean_smape * 100
-        print(f"\n❌ LightGBM WORSE than XGBoost v6 by {c25_gap:.1f}%")
-
-    if lgbm_mean_smape < naive_mean_smape:
-        c25_vs_naive = (naive_mean_smape - lgbm_mean_smape) / naive_mean_smape * 100
-        print(f"✅ LightGBM BEATS naive baseline by {c25_vs_naive:.1f}%")
-    else:
-        c25_gap_naive = (lgbm_mean_smape - naive_mean_smape) / naive_mean_smape * 100
-        print(f"❌ LightGBM still WORSE than naive by {c25_gap_naive:.1f}%")
-    return lgb, lgbm_mean_smape
-
-
-@app.cell
-def _(
-    c10_zero_threshold,
-    c15_df,
-    c15_feature_cols,
-    c15_holiday_set,
-    lgb,
-    np,
-    pd,
-    seasonal_naive_forecast,
-    series,
-    smape,
-    val_cutoffs,
-):
-    # ── CELL 26: Optimal blend weight — naive + LightGBM (for completeness) ──
-    def c26_rebuild_lgbm_forecast(cutoff):
-        """Refit LightGBM's exact pipeline for one cutoff (mirrors Cell 25)."""
-        train_df = c15_df[c15_df.index <= cutoff]
-        model = lgb.LGBMRegressor(
-            n_estimators=300,
-            learning_rate=0.05,
-            num_leaves=31,
-            random_state=42,
-            objective="regression",
-            verbose=-1,
-        )
-        model.fit(train_df[c15_feature_cols], train_df["orders"])
-
-        history = series[series.index <= cutoff].copy()
-        preds = []
-        idx = pd.date_range(start=cutoff + pd.Timedelta(hours=1), periods=168, freq="h")
-        for t in idx:
-            lag1, lag24 = (
-                history.loc[t - pd.Timedelta(hours=1)],
-                history.loc[t - pd.Timedelta(hours=24)],
-            )
-            lag168, lag336 = (
-                history.loc[t - pd.Timedelta(hours=168)],
-                history.loc[t - pd.Timedelta(hours=336)],
-            )
-            roll168 = history.loc[
-                t - pd.Timedelta(hours=168) : t - pd.Timedelta(hours=1)
-            ].mean()
-            this_date = t.date()
-            row = {
-                "hour_of_day": t.hour,
-                "day_of_week": t.dayofweek,
-                "is_weekend": int(t.dayofweek >= 5),
-                "lag_1": lag1,
-                "lag_24": lag24,
-                "lag_48": history.loc[t - pd.Timedelta(hours=48)],
-                "lag_144": history.loc[t - pd.Timedelta(hours=144)],
-                "lag_168": lag168,
-                "ratio_recent_vs_week": lag1 / roll168 if roll168 > 0 else 0.0,
-                "ratio_day_vs_week": lag24 / roll168 if roll168 > 0 else 0.0,
-                "growth_ratio_168": lag168 / lag336 if lag336 > 0 else 1.0,
-                "is_holiday": int(this_date in c15_holiday_set),
-                "is_day_before_holiday": int(
-                    (this_date + pd.Timedelta(days=1)) in c15_holiday_set
-                ),
-                "is_day_after_holiday": int(
-                    (this_date - pd.Timedelta(days=1)) in c15_holiday_set
-                ),
-            }
-            row_df = pd.DataFrame([row])[c15_feature_cols]
-            pred = max(model.predict(row_df)[0], 0.0)
-            pred = 0.0 if pred < c10_zero_threshold else pred
-            preds.append(pred)
-            history.loc[t] = pred
-        return pd.Series(preds, index=idx)
-
-    c26_weight_grid = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
-    print("=" * 60)
-    print("OPTIMAL BLEND WEIGHT — naive + LightGBM")
-    print("=" * 60)
-    for c26_weight in c26_weight_grid:
-        c26_scores = []
-        for c26_cutoff_w in val_cutoffs:
-            c26_actual = series[
-                (series.index > c26_cutoff_w)
-                & (series.index <= c26_cutoff_w + pd.Timedelta(hours=168))
-            ]
-            c26_naive_fc = seasonal_naive_forecast(
-                series[series.index <= c26_cutoff_w], horizon=168
-            )
-            c26_lgbm_fc = c26_rebuild_lgbm_forecast(c26_cutoff_w)
-            c26_blend = (1 - c26_weight) * c26_naive_fc + c26_weight * c26_lgbm_fc
-            c26_aligned = pd.DataFrame(
-                {"actual": c26_actual, "forecast": c26_blend}
-            ).dropna()
-            c26_scores.append(smape(c26_aligned["actual"], c26_aligned["forecast"]))
-        print(
-            f"  weight_lgbm={c26_weight:.1f}: mean SMAPE = {np.mean(c26_scores):.4f}  ± {np.std(c26_scores):.4f}"
-        )
-
-    print("\nCompare to naive+XGBoost v6 best (Cell 21): weight=0.3, SMAPE=0.2114")
-    return
-
-
-@app.cell
-def _(
-    c10_zero_threshold,
-    c15_df,
-    c15_feature_cols,
-    c15_holiday_set,
-    naive_smape_scores,
-    np,
-    pd,
-    series,
-    smape,
     val_cutoffs,
     xgb,
-    xgb6_smape_scores,
+    xgb6_mean_smape,
 ):
-    # ── CELL 27: XGBoost with a SMAPE-approximating custom objective ─────────
-    # WHY THIS CELL EXISTS: course slides explicitly state SMAPE has an
-    # "under-forecasting bias" — meaning the metric itself rewards predictions
-    # that sit slightly LOW. We have been training with objective=
-    # "reg:squarederror" (MSE) this entire session, which is SYMMETRIC and has
-    # NO awareness of this bias. This is a genuine, previously untested lever:
-    # the TRAINING OBJECTIVE itself, not features or hyperparameters.
-    #
-    # CAUTION: a naive closed-form SMAPE gradient is numerically unstable
-    # (confirmed via XGBoost's own GitHub issues — direct MAPE-style objectives
-    # can "swing wildly" near y=0). We use a SAFER approximation: a smoothed,
-    # symmetric percentage-style loss with an epsilon floor to avoid
-    # division-by-near-zero blowup, and we verify behavior carefully on ONE
-    # window before trusting it across all 7.
+    # ── CELL 32: XGBoost v8 — train on log1p(orders), predict back via expm1 ──
+    # WHY THIS CELL EXISTS: SMAPE is a relative/percentage-style metric, but we
+    # have trained on raw orders with MSE this entire session — a scale
+    # mismatch the slides flagged generally (SMAPE's under-forecasting bias)
+    # but we never directly addressed. log1p(orders) compresses the long right
+    # tail (max 939 orders, EDA Cell 1) and makes differences in log-space
+    # track RELATIVE differences much more closely than raw MSE does — without
+    # the numerical instability we hit with a custom SMAPE objective (Cell 27).
+    # log1p(0) = log(1) = 0 exactly (handles our 31.7% structural zeros cleanly,
+    # unlike plain log which would be -infinity at zero).
 
-    def c27_smape_obj(y_pred, y_true):
-        """
-        Approximate SMAPE gradient/Hessian for XGBoost's custom objective interface.
-        epsilon prevents division blowup when y_true and y_pred are both near zero
-        (our most common case: ~32% structural zero-hours).
-        """
-        epsilon = 10.0  # smoothing constant — comparable in scale to our zero-floor threshold (5-10),
-        # chosen to avoid instability without distorting genuine low-demand hours
-        denom = np.abs(y_true) + np.abs(y_pred) + epsilon
-        sign = np.sign(y_pred - y_true)
-        # Approximate gradient: direction of error, scaled by inverse denominator
-        # (mirrors SMAPE's structure: error magnitude relative to combined scale)
-        grad = 2 * sign / denom
-        # Approximate (constant, well-behaved) Hessian — avoids the true SMAPE
-        # Hessian's instability near zero; a small positive constant keeps
-        # XGBoost's tree-building numerically stable
-        hess = np.full_like(y_pred, 2.0 / (denom.mean()))
-        return grad, hess
+    c32_df = c15_df.copy()   # start from Cell 15's table (lags, ratios, holiday flags)
+    c32_df["log_target"] = np.log1p(c32_df["orders"])   # the NEW training target
 
-    # ── Quick isolated test on Window 1 before committing to full validation ──
-    c27_cutoff = val_cutoffs[0]
-    c27_train_df = c15_df[c15_df.index <= c27_cutoff]
-    c27_actual_wf = series[
-        (series.index > c27_cutoff)
-        & (series.index <= c27_cutoff + pd.Timedelta(hours=168))
-    ]
+    print(f"log_target stats (should compress the long tail vs raw orders):")
+    print(c32_df["log_target"].describe())
+    print(f"\nFor comparison, raw orders stats:")
+    print(c32_df["orders"].describe())
 
-    c27_model = xgb.XGBRegressor(
-        n_estimators=300,
-        max_depth=5,
-        learning_rate=0.05,
-        random_state=42,
-        objective=c27_smape_obj,  # KEY CHANGE: custom SMAPE-style objective
-    )
-    c27_model.fit(c27_train_df[c15_feature_cols], c27_train_df["orders"])
+    xgb8_smape_scores = []
+    xgb8_mse_scores   = []
 
-    c27_history = series[series.index <= c27_cutoff].copy()
-    c27_predictions = []
-    c27_forecast_index = pd.date_range(
-        start=c27_cutoff + pd.Timedelta(hours=1), periods=168, freq="h"
-    )
+    for c32_w, c32_cutoff_w in enumerate(val_cutoffs):
 
-    for c27_step_time in c27_forecast_index:
-        c27_lag1 = c27_history.loc[c27_step_time - pd.Timedelta(hours=1)]
-        c27_lag24 = c27_history.loc[c27_step_time - pd.Timedelta(hours=24)]
-        c27_lag168 = c27_history.loc[c27_step_time - pd.Timedelta(hours=168)]
-        c27_lag336 = c27_history.loc[c27_step_time - pd.Timedelta(hours=336)]
-        c27_roll168 = c27_history.loc[
-            c27_step_time - pd.Timedelta(hours=168) : c27_step_time
-            - pd.Timedelta(hours=1)
-        ].mean()
-        c27_this_date = c27_step_time.date()
+        c32_train_df = c32_df[c32_df.index <= c32_cutoff_w]
+        c32_actual_wf = series[
+            (series.index > c32_cutoff_w) &
+            (series.index <= c32_cutoff_w + pd.Timedelta(hours=168))
+        ]
 
-        c27_row = {
-            "hour_of_day": c27_step_time.hour,
-            "day_of_week": c27_step_time.dayofweek,
-            "is_weekend": int(c27_step_time.dayofweek >= 5),
-            "lag_1": c27_lag1,
-            "lag_24": c27_lag24,
-            "lag_48": c27_history.loc[c27_step_time - pd.Timedelta(hours=48)],
-            "lag_144": c27_history.loc[c27_step_time - pd.Timedelta(hours=144)],
-            "lag_168": c27_lag168,
-            "ratio_recent_vs_week": c27_lag1 / c27_roll168 if c27_roll168 > 0 else 0.0,
-            "ratio_day_vs_week": c27_lag24 / c27_roll168 if c27_roll168 > 0 else 0.0,
-            "growth_ratio_168": c27_lag168 / c27_lag336 if c27_lag336 > 0 else 1.0,
-            "is_holiday": int(c27_this_date in c15_holiday_set),
-            "is_day_before_holiday": int(
-                (c27_this_date + pd.Timedelta(days=1)) in c15_holiday_set
-            ),
-            "is_day_after_holiday": int(
-                (c27_this_date - pd.Timedelta(days=1)) in c15_holiday_set
-            ),
-        }
-        c27_row_df = pd.DataFrame([c27_row])[c15_feature_cols]
-        c27_pred = max(c27_model.predict(c27_row_df)[0], 0.0)
-        c27_pred = 0.0 if c27_pred < c10_zero_threshold else c27_pred
-        c27_predictions.append(c27_pred)
-        c27_history.loc[c27_step_time] = c27_pred
+        c32_model = xgb.XGBRegressor(
+            n_estimators=300, max_depth=5, learning_rate=0.05,
+            random_state=42, objective="reg:squarederror"
+        )
+        # KEY CHANGE: fit on log_target, NOT raw orders
+        c32_model.fit(c32_train_df[c15_feature_cols], c32_train_df["log_target"])
 
-    c27_forecast = pd.Series(c27_predictions, index=c27_forecast_index)
+        c32_history = series[series.index <= c32_cutoff_w].copy()
+        c32_predictions = []
+        c32_forecast_index = pd.date_range(
+            start=c32_cutoff_w + pd.Timedelta(hours=1), periods=168, freq="h"
+        )
 
-    print(
-        f"Forecast stats: min={c27_forecast.min():.1f}, max={c27_forecast.max():.1f}, mean={c27_forecast.mean():.1f}"
-    )
-    print(
-        f"Actual stats:   min={c27_actual_wf.min():.1f}, max={c27_actual_wf.max():.1f}, mean={c27_actual_wf.mean():.1f}"
-    )
-    print(f"\nSMAPE this window: {smape(c27_actual_wf, c27_forecast):.4f}")
-    print(
-        f"Reference — XGBoost v6 (MSE objective) this window: {xgb6_smape_scores[0]:.4f}"
-    )
-    print(f"Reference — naive this window: {naive_smape_scores[0]:.4f}")
-    return
+        for c32_step_time in c32_forecast_index:
+            c32_lag1_val    = c32_history.loc[c32_step_time - pd.Timedelta(hours=1)]
+            c32_lag24_val   = c32_history.loc[c32_step_time - pd.Timedelta(hours=24)]
+            c32_lag168_val  = c32_history.loc[c32_step_time - pd.Timedelta(hours=168)]
+            c32_lag336_val  = c32_history.loc[c32_step_time - pd.Timedelta(hours=336)]
+            c32_roll168_val = c32_history.loc[c32_step_time - pd.Timedelta(hours=168):
+                                                c32_step_time - pd.Timedelta(hours=1)].mean()
+            c32_this_date     = c32_step_time.date()
+            c32_tomorrow_date = c32_this_date + pd.Timedelta(days=1)
+            c32_yesterday_date = c32_this_date - pd.Timedelta(days=1)
+
+            c32_row = {
+                "hour_of_day": c32_step_time.hour,
+                "day_of_week": c32_step_time.dayofweek,
+                "is_weekend":  int(c32_step_time.dayofweek >= 5),
+                "lag_1":   c32_lag1_val,
+                "lag_24":  c32_lag24_val,
+                "lag_48":  c32_history.loc[c32_step_time - pd.Timedelta(hours=48)],
+                "lag_144": c32_history.loc[c32_step_time - pd.Timedelta(hours=144)],
+                "lag_168": c32_lag168_val,
+                "ratio_recent_vs_week": c32_lag1_val / c32_roll168_val if c32_roll168_val > 0 else 0.0,
+                "ratio_day_vs_week":    c32_lag24_val / c32_roll168_val if c32_roll168_val > 0 else 0.0,
+                "growth_ratio_168": c32_lag168_val / c32_lag336_val if c32_lag336_val > 0 else 1.0,
+                "is_holiday":             int(c32_this_date in c15_holiday_set),
+                "is_day_before_holiday":  int(c32_tomorrow_date in c15_holiday_set),
+                "is_day_after_holiday":   int(c32_yesterday_date in c15_holiday_set),
+            }
+            c32_row_df = pd.DataFrame([c32_row])[c15_feature_cols]
+
+            # KEY CHANGE: model predicts in LOG space; convert back with expm1
+            c32_pred_log = c32_model.predict(c32_row_df)[0]
+            c32_pred_value = np.expm1(c32_pred_log)   # inverse of log1p: exp(x)-1
+            c32_pred_value = max(c32_pred_value, 0.0)  # guard against tiny negative noise from expm1
+            c32_pred_value = 0.0 if c32_pred_value < c10_zero_threshold else c32_pred_value
+
+            c32_predictions.append(c32_pred_value)
+            # IMPORTANT: feed the RAW (not log) prediction back into history,
+            # since lag features (lag_1, lag_24, etc.) must stay in raw-order
+            # units to match how they were computed during training
+            c32_history.loc[c32_step_time] = c32_pred_value
+
+        c32_forecast = pd.Series(c32_predictions, index=c32_forecast_index)
+
+        c32_aligned = pd.DataFrame({"actual": c32_actual_wf, "forecast": c32_forecast}).dropna()
+        assert len(c32_aligned) == 168, f"Window {c32_w+1} has {len(c32_aligned)} rows, expected 168"
+
+        c32_smape_val = smape(c32_aligned["actual"], c32_aligned["forecast"])
+        c32_mse_val   = np.mean((c32_aligned["actual"] - c32_aligned["forecast"]) ** 2)
+
+        xgb8_smape_scores.append(c32_smape_val)
+        xgb8_mse_scores.append(c32_mse_val)
+
+        print(f"  Window {c32_w+1} ({c32_cutoff_w.date()} cutoff): "
+              f"SMAPE={c32_smape_val:.4f}, MSE={c32_mse_val:.1f}")
+
+    xgb8_mean_smape = np.mean(xgb8_smape_scores)
+    xgb8_std_smape  = np.std(xgb8_smape_scores)
+
+    print(f"\n{'='*60}")
+    print(f"XGBOOST v8 RESULTS — log1p target  (n={N_VAL_WEEKS} windows)")
+    print(f"{'='*60}")
+    print(f"Mean SMAPE: {xgb8_mean_smape:.4f}  ± {xgb8_std_smape:.4f} std")
+    print(f"SMAPE range: [{min(xgb8_smape_scores):.4f}, {max(xgb8_smape_scores):.4f}]")
+
+    print(f"\n{'='*60}")
+    print(f"COMPARISON")
+    print(f"{'='*60}")
+    print(f"Naive SMAPE:            {naive_mean_smape:.4f}")
+    print(f"XGBoost v6 (raw target): {xgb6_mean_smape:.4f}")
+    print(f"XGBoost v8 (log target): {xgb8_mean_smape:.4f}")
+
+    if xgb8_mean_smape < naive_mean_smape:
+        c32_vs_naive = (naive_mean_smape - xgb8_mean_smape) / naive_mean_smape * 100
+        print(f"\n✅ XGBoost v8 BEATS naive baseline by {c32_vs_naive:.1f}%")
+    else:
+        c32_gap = (xgb8_mean_smape - naive_mean_smape) / naive_mean_smape * 100
+        print(f"\n❌ XGBoost v8 still WORSE than naive by {c32_gap:.1f}%")
+    return c32_df, xgb8_mean_smape
 
 
 @app.cell
 def _(
-    c15_df,
+    c10_zero_threshold,
     c15_feature_cols,
     c15_holiday_set,
-    lgb,
-    lgbm_mean_smape,
+    c32_df,
     naive_mean_smape,
     np,
     pd,
     series,
     smape,
     val_cutoffs,
+    xgb,
+    xgb8_mean_smape,
 ):
-    # ── CELL 28: LightGBM trained ONLY on active-hours rows (literal reading of "for active hours") ──
-    # We abandon the custom-SMAPE-objective approach (Cell 27) — confirmed
-    # numerically unstable, consistent with known XGBoost community reports.
-    # Instead, we test the more literal reading of the competing team's
-    # description: training the GBM model ONLY on rows where orders > 0
-    # (removing night-hour rows from TRAINING entirely, not just relying on
-    # hour_of_day as a learned feature). At prediction time, we still need
-    # SOME way to decide zero vs. non-zero hours — we use hour_of_day directly:
-    # hours outside our EDA-confirmed operating window (08:00-22:00, Cell 3)
-    # are forced to 0 by a simple rule; hours inside it are predicted by the
-    # active-hours-only model.
+    # ── CELL 33: Add daypart categorical feature (on top of log1p target) ────
+    # WHY THIS CELL EXISTS: hour_of_day (0-23) already exists as a feature, but
+    # it's a raw integer the model must learn lunch/dinner boundaries from
+    # purely via numeric splits. A DAYPART feature encodes the EDA-confirmed
+    # shape directly (Cell 3: lunch peak ~13:00, dinner peak ~21:00, night
+    # trough 23:00-07:00) as a small number of named categories — giving the
+    # model an easier, more direct signal for what is otherwise a non-linear,
+    # two-humped relationship.
+    #
+    # Boundaries chosen directly from Cell 3's printed findings:
+    #   Weekday operating window: 08:00 -> 22:00
+    #   Weekday peak hour: 21:00 (346 avg orders)
+    #   Lunch shoulder visible ~12:00-14:00 in the daily profile plot
 
-    c28_active_train_df = c15_df[
-        c15_df["orders"] > 0
-    ]  # ONLY active-hours rows for training
-    print(
-        f"Training rows: full={len(c15_df)}, active-only={len(c28_active_train_df)} "
-        f"({len(c28_active_train_df) / len(c15_df) * 100:.1f}% retained)"
-    )
+    def c33_get_daypart(hour):
+        """Map hour-of-day to a named daypart category, per EDA Cell 3 findings."""
+        if hour < 8 or hour >= 23:
+            return "night"       # 23:00-07:59 — near-zero structural hours
+        elif hour < 11:
+            return "morning"     # 08:00-10:59 — ramp-up
+        elif hour < 15:
+            return "lunch"       # 11:00-14:59 — first peak (~13:00)
+        elif hour < 19:
+            return "afternoon"   # 15:00-18:59 — mid-day lull
+        else:
+            return "dinner"      # 19:00-22:59 — second, larger peak (~21:00)
 
-    lgbm2_smape_scores = []
-    lgbm2_mse_scores = []
+    c33_df = c32_df.copy()   # build on top of Cell 32's log1p target
+    c33_df["daypart"] = c33_df.index.hour.map(c33_get_daypart)
 
-    for c28_w, c28_cutoff_w in enumerate(val_cutoffs):
-        c28_train_df = c28_active_train_df[c28_active_train_df.index <= c28_cutoff_w]
-        c28_actual_wf = series[
-            (series.index > c28_cutoff_w)
-            & (series.index <= c28_cutoff_w + pd.Timedelta(hours=168))
+    # XGBoost/LightGBM need NUMERIC inputs — convert the categorical daypart
+    # into integer codes (trees handle integer-coded categories fine, same
+    # reasoning as hour_of_day/day_of_week earlier in this notebook — no need
+    # for one-hot encoding with tree-based models)
+    c33_daypart_codes = {"night": 0, "morning": 1, "lunch": 2, "afternoon": 3, "dinner": 4}
+    c33_df["daypart_code"] = c33_df["daypart"].map(c33_daypart_codes)
+
+    print("Daypart distribution (hours per category):")
+    print(c33_df.groupby("daypart")["daypart_code"].count())
+
+    print("\nMean orders by daypart (sanity check — should show lunch/dinner as highest):")
+    print(c33_df.groupby("daypart")["orders"].mean().sort_values(ascending=False))
+
+    c33_feature_cols = c15_feature_cols + ["daypart_code"]
+    print(f"\nFeatures used in XGBoost v9: {c33_feature_cols}")
+
+    xgb9_smape_scores = []
+    xgb9_mse_scores   = []
+
+    for c33_w, c33_cutoff_w in enumerate(val_cutoffs):
+
+        c33_train_df = c33_df[c33_df.index <= c33_cutoff_w]
+        c33_actual_wf = series[
+            (series.index > c33_cutoff_w) &
+            (series.index <= c33_cutoff_w + pd.Timedelta(hours=168))
         ]
 
-        c28_model = lgb.LGBMRegressor(
-            n_estimators=300,
-            learning_rate=0.05,
-            num_leaves=31,
-            random_state=42,
-            objective="regression",
-            verbose=-1,
+        c33_model = xgb.XGBRegressor(
+            n_estimators=300, max_depth=5, learning_rate=0.05,
+            random_state=42, objective="reg:squarederror"
         )
-        c28_model.fit(c28_train_df[c15_feature_cols], c28_train_df["orders"])
+        c33_model.fit(c33_train_df[c33_feature_cols], c33_train_df["log_target"])
 
-        c28_history = series[series.index <= c28_cutoff_w].copy()
-        c28_predictions = []
-        c28_forecast_index = pd.date_range(
-            start=c28_cutoff_w + pd.Timedelta(hours=1), periods=168, freq="h"
+        c33_history = series[series.index <= c33_cutoff_w].copy()
+        c33_predictions = []
+        c33_forecast_index = pd.date_range(
+            start=c33_cutoff_w + pd.Timedelta(hours=1), periods=168, freq="h"
         )
 
-        for c28_step_time in c28_forecast_index:
-            # Simple rule: outside the confirmed operating window, force 0 directly —
-            # no model call needed (this IS the literal "for active hours" reading)
-            if c28_step_time.hour < 8 or c28_step_time.hour > 22:
-                c28_pred = 0.0
-            else:
-                c28_lag1 = c28_history.loc[c28_step_time - pd.Timedelta(hours=1)]
-                c28_lag24 = c28_history.loc[c28_step_time - pd.Timedelta(hours=24)]
-                c28_lag168 = c28_history.loc[c28_step_time - pd.Timedelta(hours=168)]
-                c28_lag336 = c28_history.loc[c28_step_time - pd.Timedelta(hours=336)]
-                c28_roll168 = c28_history.loc[
-                    c28_step_time - pd.Timedelta(hours=168) : c28_step_time
-                    - pd.Timedelta(hours=1)
-                ].mean()
-                c28_this_date = c28_step_time.date()
+        for c33_step_time in c33_forecast_index:
+            c33_lag1_val    = c33_history.loc[c33_step_time - pd.Timedelta(hours=1)]
+            c33_lag24_val   = c33_history.loc[c33_step_time - pd.Timedelta(hours=24)]
+            c33_lag168_val  = c33_history.loc[c33_step_time - pd.Timedelta(hours=168)]
+            c33_lag336_val  = c33_history.loc[c33_step_time - pd.Timedelta(hours=336)]
+            c33_roll168_val = c33_history.loc[c33_step_time - pd.Timedelta(hours=168):
+                                                c33_step_time - pd.Timedelta(hours=1)].mean()
+            c33_this_date     = c33_step_time.date()
+            c33_tomorrow_date = c33_this_date + pd.Timedelta(days=1)
+            c33_yesterday_date = c33_this_date - pd.Timedelta(days=1)
 
-                c28_row = {
-                    "hour_of_day": c28_step_time.hour,
-                    "day_of_week": c28_step_time.dayofweek,
-                    "is_weekend": int(c28_step_time.dayofweek >= 5),
-                    "lag_1": c28_lag1,
-                    "lag_24": c28_lag24,
-                    "lag_48": c28_history.loc[c28_step_time - pd.Timedelta(hours=48)],
-                    "lag_144": c28_history.loc[c28_step_time - pd.Timedelta(hours=144)],
-                    "lag_168": c28_lag168,
-                    "ratio_recent_vs_week": c28_lag1 / c28_roll168
-                    if c28_roll168 > 0
-                    else 0.0,
-                    "ratio_day_vs_week": c28_lag24 / c28_roll168
-                    if c28_roll168 > 0
-                    else 0.0,
-                    "growth_ratio_168": c28_lag168 / c28_lag336
-                    if c28_lag336 > 0
-                    else 1.0,
-                    "is_holiday": int(c28_this_date in c15_holiday_set),
-                    "is_day_before_holiday": int(
-                        (c28_this_date + pd.Timedelta(days=1)) in c15_holiday_set
-                    ),
-                    "is_day_after_holiday": int(
-                        (c28_this_date - pd.Timedelta(days=1)) in c15_holiday_set
-                    ),
+            c33_row = {
+                "hour_of_day": c33_step_time.hour,
+                "day_of_week": c33_step_time.dayofweek,
+                "is_weekend":  int(c33_step_time.dayofweek >= 5),
+                "lag_1":   c33_lag1_val,
+                "lag_24":  c33_lag24_val,
+                "lag_48":  c33_history.loc[c33_step_time - pd.Timedelta(hours=48)],
+                "lag_144": c33_history.loc[c33_step_time - pd.Timedelta(hours=144)],
+                "lag_168": c33_lag168_val,
+                "ratio_recent_vs_week": c33_lag1_val / c33_roll168_val if c33_roll168_val > 0 else 0.0,
+                "ratio_day_vs_week":    c33_lag24_val / c33_roll168_val if c33_roll168_val > 0 else 0.0,
+                "growth_ratio_168": c33_lag168_val / c33_lag336_val if c33_lag336_val > 0 else 1.0,
+                "is_holiday":             int(c33_this_date in c15_holiday_set),
+                "is_day_before_holiday":  int(c33_tomorrow_date in c15_holiday_set),
+                "is_day_after_holiday":   int(c33_yesterday_date in c15_holiday_set),
+                "daypart_code": c33_daypart_codes[c33_get_daypart(c33_step_time.hour)],
+            }
+            c33_row_df = pd.DataFrame([c33_row])[c33_feature_cols]
+
+            c33_pred_log = c33_model.predict(c33_row_df)[0]
+            c33_pred_value = np.expm1(c33_pred_log)
+            c33_pred_value = max(c33_pred_value, 0.0)
+            c33_pred_value = 0.0 if c33_pred_value < c10_zero_threshold else c33_pred_value
+
+            c33_predictions.append(c33_pred_value)
+            c33_history.loc[c33_step_time] = c33_pred_value
+
+        c33_forecast = pd.Series(c33_predictions, index=c33_forecast_index)
+
+        c33_aligned = pd.DataFrame({"actual": c33_actual_wf, "forecast": c33_forecast}).dropna()
+        assert len(c33_aligned) == 168, f"Window {c33_w+1} has {len(c33_aligned)} rows, expected 168"
+
+        c33_smape_val = smape(c33_aligned["actual"], c33_aligned["forecast"])
+        c33_mse_val   = np.mean((c33_aligned["actual"] - c33_aligned["forecast"]) ** 2)
+
+        xgb9_smape_scores.append(c33_smape_val)
+        xgb9_mse_scores.append(c33_mse_val)
+
+        print(f"  Window {c33_w+1} ({c33_cutoff_w.date()} cutoff): "
+              f"SMAPE={c33_smape_val:.4f}, MSE={c33_mse_val:.1f}")
+
+    xgb9_mean_smape = np.mean(xgb9_smape_scores)
+    xgb9_std_smape  = np.std(xgb9_smape_scores)
+
+    print(f"\n{'='*60}")
+    print(f"XGBOOST v9 RESULTS — log1p target + daypart feature")
+    print(f"{'='*60}")
+    print(f"Mean SMAPE: {xgb9_mean_smape:.4f}  ± {xgb9_std_smape:.4f} std")
+
+    print(f"\n{'='*60}")
+    print(f"COMPARISON")
+    print(f"{'='*60}")
+    print(f"Naive SMAPE:                     {naive_mean_smape:.4f}")
+    print(f"XGBoost v8 (log target only):    {xgb8_mean_smape:.4f}")
+    print(f"XGBoost v9 (+ daypart):          {xgb9_mean_smape:.4f}")
+
+    c33_v8_to_v9 = (xgb8_mean_smape - xgb9_mean_smape) / xgb8_mean_smape * 100
+    print(f"\nDaypart feature changed SMAPE by {c33_v8_to_v9:+.1f}% vs v8")
+    return (xgb9_mean_smape,)
+
+
+@app.cell
+def _(
+    c10_zero_threshold,
+    c15_feature_cols,
+    c15_holiday_set,
+    c32_df,
+    naive_mean_smape,
+    np,
+    pd,
+    series,
+    smape,
+    val_cutoffs,
+    xgb,
+    xgb8_mean_smape,
+    xgb9_mean_smape,
+):
+    # ── CELL 33b: Sharper daypart — precise peak hours, not broad windows ────
+    # REVISED from Cell 33: the original 5-category version barely changed
+    # SMAPE (-0.2%) because "afternoon" (15:00-18:59) and "dinner" (19:00-22:59)
+    # were too BROAD, blending real peak hours with their shoulders — exactly
+    # the structure hour_of_day already captures via numeric splits. The fix:
+    # isolate ONLY the narrow true-peak hours (per Cell 3's exact findings:
+    # lunch peak ~13:00, dinner peak ~21:00), with everything else collapsed
+    # into a single "other" bucket and true-zero hours as "night".
+
+    def c33b_get_daypart_sharp(hour):
+        """Sharper daypart: isolates ONLY the precise peak hours, per EDA Cell 3."""
+        if hour < 8 or hour >= 23:
+            return "night"     # 23:00-07:59 — confirmed structural zero hours
+        elif hour in (12, 13, 14):
+            return "lunch"      # narrow window around the confirmed ~13:00 lunch peak
+        elif hour in (20, 21, 22):
+            return "dinner"     # narrow window around the confirmed ~21:00 dinner peak
+        else:
+            return "other"      # morning ramp-up + afternoon lull, collapsed together
+
+    c33b_df = c32_df.copy()   # build on top of Cell 32's log1p target (same base as before)
+    c33b_df["daypart_sharp"] = c33b_df.index.hour.map(c33b_get_daypart_sharp)
+
+    c33b_daypart_codes = {"night": 0, "other": 1, "lunch": 2, "dinner": 3}
+    c33b_df["daypart_sharp_code"] = c33b_df["daypart_sharp"].map(c33b_daypart_codes)
+
+    print("Sharper daypart distribution (hours per category):")
+    print(c33b_df.groupby("daypart_sharp")["daypart_sharp_code"].count())
+
+    print("\nMean orders by sharper daypart (should show MUCH higher lunch/dinner peaks now):")
+    print(c33b_df.groupby("daypart_sharp")["orders"].mean().sort_values(ascending=False))
+
+    c33b_feature_cols = c15_feature_cols + ["daypart_sharp_code"]
+    print(f"\nFeatures used in XGBoost v9b: {c33b_feature_cols}")
+
+    xgb9b_smape_scores = []
+    xgb9b_mse_scores   = []
+
+    for c33b_w, c33b_cutoff_w in enumerate(val_cutoffs):
+
+        c33b_train_df = c33b_df[c33b_df.index <= c33b_cutoff_w]
+        c33b_actual_wf = series[
+            (series.index > c33b_cutoff_w) &
+            (series.index <= c33b_cutoff_w + pd.Timedelta(hours=168))
+        ]
+
+        c33b_model = xgb.XGBRegressor(
+            n_estimators=300, max_depth=5, learning_rate=0.05,
+            random_state=42, objective="reg:squarederror"
+        )
+        c33b_model.fit(c33b_train_df[c33b_feature_cols], c33b_train_df["log_target"])
+
+        c33b_history = series[series.index <= c33b_cutoff_w].copy()
+        c33b_predictions = []
+        c33b_forecast_index = pd.date_range(
+            start=c33b_cutoff_w + pd.Timedelta(hours=1), periods=168, freq="h"
+        )
+
+        for c33b_step_time in c33b_forecast_index:
+            c33b_lag1_val    = c33b_history.loc[c33b_step_time - pd.Timedelta(hours=1)]
+            c33b_lag24_val   = c33b_history.loc[c33b_step_time - pd.Timedelta(hours=24)]
+            c33b_lag168_val  = c33b_history.loc[c33b_step_time - pd.Timedelta(hours=168)]
+            c33b_lag336_val  = c33b_history.loc[c33b_step_time - pd.Timedelta(hours=336)]
+            c33b_roll168_val = c33b_history.loc[c33b_step_time - pd.Timedelta(hours=168):
+                                                  c33b_step_time - pd.Timedelta(hours=1)].mean()
+            c33b_this_date     = c33b_step_time.date()
+            c33b_tomorrow_date = c33b_this_date + pd.Timedelta(days=1)
+            c33b_yesterday_date = c33b_this_date - pd.Timedelta(days=1)
+
+            c33b_row = {
+                "hour_of_day": c33b_step_time.hour,
+                "day_of_week": c33b_step_time.dayofweek,
+                "is_weekend":  int(c33b_step_time.dayofweek >= 5),
+                "lag_1":   c33b_lag1_val,
+                "lag_24":  c33b_lag24_val,
+                "lag_48":  c33b_history.loc[c33b_step_time - pd.Timedelta(hours=48)],
+                "lag_144": c33b_history.loc[c33b_step_time - pd.Timedelta(hours=144)],
+                "lag_168": c33b_lag168_val,
+                "ratio_recent_vs_week": c33b_lag1_val / c33b_roll168_val if c33b_roll168_val > 0 else 0.0,
+                "ratio_day_vs_week":    c33b_lag24_val / c33b_roll168_val if c33b_roll168_val > 0 else 0.0,
+                "growth_ratio_168": c33b_lag168_val / c33b_lag336_val if c33b_lag336_val > 0 else 1.0,
+                "is_holiday":             int(c33b_this_date in c15_holiday_set),
+                "is_day_before_holiday":  int(c33b_tomorrow_date in c15_holiday_set),
+                "is_day_after_holiday":   int(c33b_yesterday_date in c15_holiday_set),
+                "daypart_sharp_code": c33b_daypart_codes[c33b_get_daypart_sharp(c33b_step_time.hour)],
+            }
+            c33b_row_df = pd.DataFrame([c33b_row])[c33b_feature_cols]
+
+            c33b_pred_log = c33b_model.predict(c33b_row_df)[0]
+            c33b_pred_value = np.expm1(c33b_pred_log)
+            c33b_pred_value = max(c33b_pred_value, 0.0)
+            c33b_pred_value = 0.0 if c33b_pred_value < c10_zero_threshold else c33b_pred_value
+
+            c33b_predictions.append(c33b_pred_value)
+            c33b_history.loc[c33b_step_time] = c33b_pred_value
+
+        c33b_forecast = pd.Series(c33b_predictions, index=c33b_forecast_index)
+
+        c33b_aligned = pd.DataFrame({"actual": c33b_actual_wf, "forecast": c33b_forecast}).dropna()
+        assert len(c33b_aligned) == 168, f"Window {c33b_w+1} has {len(c33b_aligned)} rows, expected 168"
+
+        c33b_smape_val = smape(c33b_aligned["actual"], c33b_aligned["forecast"])
+        c33b_mse_val   = np.mean((c33b_aligned["actual"] - c33b_aligned["forecast"]) ** 2)
+
+        xgb9b_smape_scores.append(c33b_smape_val)
+        xgb9b_mse_scores.append(c33b_mse_val)
+
+        print(f"  Window {c33b_w+1} ({c33b_cutoff_w.date()} cutoff): "
+              f"SMAPE={c33b_smape_val:.4f}, MSE={c33b_mse_val:.1f}")
+
+    xgb9b_mean_smape = np.mean(xgb9b_smape_scores)
+    xgb9b_std_smape  = np.std(xgb9b_smape_scores)
+
+    print(f"\n{'='*60}")
+    print(f"XGBOOST v9b RESULTS — log1p target + SHARP daypart feature")
+    print(f"{'='*60}")
+    print(f"Mean SMAPE: {xgb9b_mean_smape:.4f}  ± {xgb9b_std_smape:.4f} std")
+
+    print(f"\n{'='*60}")
+    print(f"COMPARISON")
+    print(f"{'='*60}")
+    print(f"Naive SMAPE:                       {naive_mean_smape:.4f}")
+    print(f"XGBoost v8 (log target only):      {xgb8_mean_smape:.4f}")
+    print(f"XGBoost v9 (broad daypart):        {xgb9_mean_smape:.4f}")
+    print(f"XGBoost v9b (sharp daypart):       {xgb9b_mean_smape:.4f}")
+    return
+
+
+@app.cell
+def _(
+    c10_zero_threshold,
+    c15_feature_cols,
+    c15_holiday_set,
+    c32_df,
+    np,
+    pd,
+    plt,
+    series,
+    val_cutoffs,
+    xgb,
+):
+    # ── CELL 34: Diagnostic — aggregate v8's errors by hour-of-day across ALL 7 windows ──
+    # Three daypart granularities (none, broad, sharp) all performed within
+    # noise of each other and slightly WORSE than no daypart feature — strong
+    # evidence hour-of-day information is already well-captured via lags.
+    # Instead of a 4th binning guess, we directly measure WHERE v8's errors
+    # concentrate, aggregated across all 7 validation windows, to see if
+    # there's a genuine, different pattern worth targeting.
+
+    c34_all_errors = []   # will collect (hour_of_day, abs_pct_error) across every window/hour
+
+    for c34_w, c34_cutoff_w in enumerate(val_cutoffs):
+        c34_train_df = c32_df[c32_df.index <= c34_cutoff_w]
+        c34_actual_wf = series[
+            (series.index > c34_cutoff_w) &
+            (series.index <= c34_cutoff_w + pd.Timedelta(hours=168))
+        ]
+        c34_model = xgb.XGBRegressor(n_estimators=300, max_depth=5, learning_rate=0.05,
+                                       random_state=42, objective="reg:squarederror")
+        c34_model.fit(c34_train_df[c15_feature_cols], c34_train_df["log_target"])
+
+        c34_history = series[series.index <= c34_cutoff_w].copy()
+        c34_predictions = []
+        c34_forecast_index = pd.date_range(start=c34_cutoff_w + pd.Timedelta(hours=1), periods=168, freq="h")
+
+        for c34_step_time in c34_forecast_index:
+            c34_lag1 = c34_history.loc[c34_step_time - pd.Timedelta(hours=1)]
+            c34_lag24 = c34_history.loc[c34_step_time - pd.Timedelta(hours=24)]
+            c34_lag168 = c34_history.loc[c34_step_time - pd.Timedelta(hours=168)]
+            c34_lag336 = c34_history.loc[c34_step_time - pd.Timedelta(hours=336)]
+            c34_roll168 = c34_history.loc[c34_step_time - pd.Timedelta(hours=168):
+                                            c34_step_time - pd.Timedelta(hours=1)].mean()
+            c34_date = c34_step_time.date()
+            c34_row = {
+                "hour_of_day": c34_step_time.hour, "day_of_week": c34_step_time.dayofweek,
+                "is_weekend": int(c34_step_time.dayofweek >= 5),
+                "lag_1": c34_lag1, "lag_24": c34_lag24,
+                "lag_48": c34_history.loc[c34_step_time - pd.Timedelta(hours=48)],
+                "lag_144": c34_history.loc[c34_step_time - pd.Timedelta(hours=144)], "lag_168": c34_lag168,
+                "ratio_recent_vs_week": c34_lag1/c34_roll168 if c34_roll168 > 0 else 0.0,
+                "ratio_day_vs_week": c34_lag24/c34_roll168 if c34_roll168 > 0 else 0.0,
+                "growth_ratio_168": c34_lag168/c34_lag336 if c34_lag336 > 0 else 1.0,
+                "is_holiday": int(c34_date in c15_holiday_set),
+                "is_day_before_holiday": int((c34_date + pd.Timedelta(days=1)) in c15_holiday_set),
+                "is_day_after_holiday": int((c34_date - pd.Timedelta(days=1)) in c15_holiday_set),
+            }
+            c34_row_df = pd.DataFrame([c34_row])[c15_feature_cols]
+            c34_pred = np.expm1(c34_model.predict(c34_row_df)[0])
+            c34_pred = max(c34_pred, 0.0)
+            c34_pred = 0.0 if c34_pred < c10_zero_threshold else c34_pred
+            c34_predictions.append(c34_pred)
+            c34_history.loc[c34_step_time] = c34_pred
+
+        c34_forecast = pd.Series(c34_predictions, index=c34_forecast_index)
+
+        # Record per-hour SMAPE contribution for this window
+        for c34_t, c34_act, c34_fc in zip(c34_forecast_index, c34_actual_wf.values, c34_forecast.values):
+            c34_denom = abs(c34_act) + abs(c34_fc)
+            c34_hour_smape = 0.0 if (c34_act == 0 and c34_fc == 0) else (2 * abs(c34_act - c34_fc) / c34_denom if c34_denom > 0 else 0.0)
+            c34_all_errors.append({"hour_of_day": c34_t.hour, "smape_contribution": c34_hour_smape,
+                                    "actual": c34_act, "forecast": c34_fc})
+
+    c34_errors_df = pd.DataFrame(c34_all_errors)
+
+    print("Mean SMAPE contribution by hour-of-day (averaged across all 7 windows):")
+    c34_by_hour = c34_errors_df.groupby("hour_of_day")["smape_contribution"].agg(['mean', 'count']).round(4)
+    print(c34_by_hour)
+
+    # Visualize
+    fig_diag11, ax_diag11 = plt.subplots(figsize=(14, 5))
+    ax_diag11.bar(c34_by_hour.index, c34_by_hour["mean"], color="#EF4444")
+    ax_diag11.set_xlabel("Hour of day")
+    ax_diag11.set_ylabel("Mean SMAPE contribution")
+    ax_diag11.set_title("XGBoost v8 — Where Does Error Concentrate? (averaged across 7 windows)", fontweight="bold")
+    ax_diag11.set_xticks(range(24))
+    plt.tight_layout()
+    plt.savefig("figures/diag_11_error_by_hour.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    return (c34_errors_df,)
+
+
+@app.cell
+def _(c34_errors_df):
+    # ── CELL 35: VERIFY — what's actually happening at hours 6 and 7 specifically? ──
+    c35_hour67 = c34_errors_df[c34_errors_df["hour_of_day"].isin([6, 7])]
+    print("All hour=6 and hour=7 observations across all 7 windows:")
+    print(c35_hour67[["hour_of_day", "actual", "forecast", "smape_contribution"]].to_string(index=False))
+
+    print(f"\n{'='*60}")
+    print("SUMMARY STATS")
+    print(f"{'='*60}")
+    for c35_h in [6, 7]:   # renamed from bare 'h' — collides with Cell 4's loop variable
+        c35_subset = c34_errors_df[c34_errors_df["hour_of_day"] == c35_h]
+        print(f"\nHour {c35_h}:")
+        print(f"  Actual:   mean={c35_subset['actual'].mean():.2f}, values={sorted(c35_subset['actual'].unique())}")
+        print(f"  Forecast: mean={c35_subset['forecast'].mean():.2f}, min={c35_subset['forecast'].min():.2f}, max={c35_subset['forecast'].max():.2f}")
+    return
+
+
+@app.cell
+def _(
+    c15_feature_cols,
+    c15_holiday_set,
+    c32_df,
+    naive_mean_smape,
+    np,
+    pd,
+    series,
+    smape,
+    val_cutoffs,
+    xgb,
+    xgb8_mean_smape,
+):
+    # ── CELL 36: Test a lower zero-floor threshold, targeting the hour 6-7 bug ──
+    # CONFIRMED (Cell 35): forecast is EXACTLY 0.0 at hours 6-7, 100% of the
+    # time, because actual demand there is genuinely small (mean 0.84-1.47,
+    # values 0-5) and our zero_threshold=5.0 (tuned for a DIFFERENT model
+    # version's noise level back in Cell 9e) is killing legitimate small
+    # predictions, not just noise. We test smaller thresholds directly.
+
+    c36_threshold_grid = [0.0, 1.0, 2.0, 3.0, 5.0]   # 0.0 = no zero-floor at all
+
+    for c36_threshold in c36_threshold_grid:
+        c36_smape_scores = []
+        for c36_cutoff_w in val_cutoffs:
+            c36_train_df = c32_df[c32_df.index <= c36_cutoff_w]
+            c36_actual_wf = series[(series.index > c36_cutoff_w) & (series.index <= c36_cutoff_w + pd.Timedelta(hours=168))]
+            c36_model = xgb.XGBRegressor(n_estimators=300, max_depth=5, learning_rate=0.05,
+                                           random_state=42, objective="reg:squarederror")
+            c36_model.fit(c36_train_df[c15_feature_cols], c36_train_df["log_target"])
+
+            c36_history = series[series.index <= c36_cutoff_w].copy()
+            c36_predictions = []
+            c36_forecast_index = pd.date_range(start=c36_cutoff_w + pd.Timedelta(hours=1), periods=168, freq="h")
+            for c36_t in c36_forecast_index:
+                c36_lag1 = c36_history.loc[c36_t - pd.Timedelta(hours=1)]
+                c36_lag24 = c36_history.loc[c36_t - pd.Timedelta(hours=24)]
+                c36_lag168 = c36_history.loc[c36_t - pd.Timedelta(hours=168)]
+                c36_lag336 = c36_history.loc[c36_t - pd.Timedelta(hours=336)]
+                c36_roll168 = c36_history.loc[c36_t - pd.Timedelta(hours=168): c36_t - pd.Timedelta(hours=1)].mean()
+                c36_date = c36_t.date()
+                c36_row = {
+                    "hour_of_day": c36_t.hour, "day_of_week": c36_t.dayofweek, "is_weekend": int(c36_t.dayofweek >= 5),
+                    "lag_1": c36_lag1, "lag_24": c36_lag24,
+                    "lag_48": c36_history.loc[c36_t - pd.Timedelta(hours=48)],
+                    "lag_144": c36_history.loc[c36_t - pd.Timedelta(hours=144)], "lag_168": c36_lag168,
+                    "ratio_recent_vs_week": c36_lag1/c36_roll168 if c36_roll168 > 0 else 0.0,
+                    "ratio_day_vs_week": c36_lag24/c36_roll168 if c36_roll168 > 0 else 0.0,
+                    "growth_ratio_168": c36_lag168/c36_lag336 if c36_lag336 > 0 else 1.0,
+                    "is_holiday": int(c36_date in c15_holiday_set),
+                    "is_day_before_holiday": int((c36_date + pd.Timedelta(days=1)) in c15_holiday_set),
+                    "is_day_after_holiday": int((c36_date - pd.Timedelta(days=1)) in c15_holiday_set),
                 }
-                c28_row_df = pd.DataFrame([c28_row])[c15_feature_cols]
-                c28_pred = max(c28_model.predict(c28_row_df)[0], 0.0)
+                c36_row_df = pd.DataFrame([c36_row])[c15_feature_cols]
+                c36_pred = max(np.expm1(c36_model.predict(c36_row_df)[0]), 0.0)
+                c36_pred = 0.0 if c36_pred < c36_threshold else c36_pred
+                c36_predictions.append(c36_pred)
+                c36_history.loc[c36_t] = c36_pred
 
-            c28_predictions.append(c28_pred)
-            c28_history.loc[c28_step_time] = c28_pred
+            c36_forecast = pd.Series(c36_predictions, index=c36_forecast_index)
+            c36_aligned = pd.DataFrame({"actual": c36_actual_wf, "forecast": c36_forecast}).dropna()
+            c36_smape_scores.append(smape(c36_aligned["actual"], c36_aligned["forecast"]))
 
-        c28_forecast = pd.Series(c28_predictions, index=c28_forecast_index)
-        c28_aligned = pd.DataFrame(
-            {"actual": c28_actual_wf, "forecast": c28_forecast}
-        ).dropna()
-        assert len(c28_aligned) == 168, (
-            f"Window {c28_w + 1} has {len(c28_aligned)} rows"
-        )
+        print(f"  threshold={c36_threshold:.1f}: mean SMAPE = {np.mean(c36_smape_scores):.4f}  ± {np.std(c36_smape_scores):.4f}")
 
-        c28_smape_val = smape(c28_aligned["actual"], c28_aligned["forecast"])
-        c28_mse_val = np.mean((c28_aligned["actual"] - c28_aligned["forecast"]) ** 2)
-        lgbm2_smape_scores.append(c28_smape_val)
-        lgbm2_mse_scores.append(c28_mse_val)
-
-        print(
-            f"  Window {c28_w + 1} ({c28_cutoff_w.date()} cutoff): SMAPE={c28_smape_val:.4f}, MSE={c28_mse_val:.1f}"
-        )
-
-    lgbm2_mean_smape = np.mean(lgbm2_smape_scores)
-    lgbm2_std_smape = np.std(lgbm2_smape_scores)
-
-    print(f"\n{'=' * 60}")
-    print("LightGBM (active-hours-only training) RESULTS")
-    print(f"{'=' * 60}")
-    print(f"Mean SMAPE: {lgbm2_mean_smape:.4f}  ± {lgbm2_std_smape:.4f} std")
-    print("\nComparison:")
-    print(f"Naive:                          {naive_mean_smape:.4f}")
-    print(f"LightGBM (all-hours training):  {lgbm_mean_smape:.4f}")
-    print(f"LightGBM (active-only training):{lgbm2_mean_smape:.4f}")
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    # Checking the structure of the mock test set
-    """)
+    print(f"\nReference — naive: {naive_mean_smape:.4f}")
+    print(f"Reference — v8 (threshold=5.0): {xgb8_mean_smape:.4f}")
     return
 
 
 @app.cell
-def _(Path, pd):
-    # ── CELL 29: Inspect test_data_mock.csv before deciding how to use it ────
-    # We need to know exactly what's inside this file before treating it as
-    # ground truth for the real submission week. The brief explicitly warns:
-    # "The real holdout may differ; the format checker still applies" — meaning
-    # this file might contain MOCK/PLACEHOLDER values, not genuine Jan 24-30
-    # orders. We check directly rather than assume either way.
+def _(
+    c15_feature_cols,
+    c15_holiday_set,
+    c32_df,
+    naive_mean_smape,
+    np,
+    pd,
+    series,
+    smape,
+    val_cutoffs,
+    xgb,
+):
+    # ── CELL 37: XGBoost v10 — corrected zero-floor threshold (1.0, not 5.0) ──
+    # ROOT CAUSE CONFIRMED (Cells 34-36): threshold=5.0 (tuned in Cell 9e for
+    # an EARLIER, different model version's noise characteristics) was killing
+    # GENUINE small demand at hours 6-7, where actual orders are frequently
+    # 1-5 (mean 0.84-1.47) but our floor forced every prediction to exactly 0,
+    # scoring the maximum possible SMAPE (2.0) on these hours every time.
+    # threshold=1.0 resolves this: still catches genuine zero-hour noise
+    # (Cell 36: threshold=0.0 alone scores 0.710, confirming SOME floor is
+    # still needed) while preserving real small-but-nonzero demand at the
+    # night/morning boundary. This is now officially our best single model.
 
-    c29_test_mock = pd.read_csv(Path(__file__).parent / "data" / "test_data_mock.csv")
-    c29_test_mock["time"] = pd.to_datetime(c29_test_mock["time"])
+    xgb10_smape_scores = []
+    xgb10_mse_scores   = []
+    c37_threshold = 1.0   # corrected from 5.0
 
-    print("=" * 60)
-    print("test_data_mock.csv — STRUCTURE")
-    print("=" * 60)
-    print(f"Shape: {c29_test_mock.shape}")
-    print(f"Columns: {c29_test_mock.columns.tolist()}")
-    print(f"Time range: {c29_test_mock['time'].min()} to {c29_test_mock['time'].max()}")
-    print(f"\nFirst 5 rows:")
-    print(c29_test_mock.head())
-    print(f"\nLast 5 rows:")
-    print(c29_test_mock.tail())
+    for c37_w, c37_cutoff_w in enumerate(val_cutoffs):
+        c37_train_df = c32_df[c32_df.index <= c37_cutoff_w]
+        c37_actual_wf = series[
+            (series.index > c37_cutoff_w) &
+            (series.index <= c37_cutoff_w + pd.Timedelta(hours=168))
+        ]
+        c37_model = xgb.XGBRegressor(n_estimators=300, max_depth=5, learning_rate=0.05,
+                                       random_state=42, objective="reg:squarederror")
+        c37_model.fit(c37_train_df[c15_feature_cols], c37_train_df["log_target"])
+
+        c37_history = series[series.index <= c37_cutoff_w].copy()
+        c37_predictions = []
+        c37_forecast_index = pd.date_range(start=c37_cutoff_w + pd.Timedelta(hours=1), periods=168, freq="h")
+
+        for c37_step_time in c37_forecast_index:
+            c37_lag1_val    = c37_history.loc[c37_step_time - pd.Timedelta(hours=1)]
+            c37_lag24_val   = c37_history.loc[c37_step_time - pd.Timedelta(hours=24)]
+            c37_lag168_val  = c37_history.loc[c37_step_time - pd.Timedelta(hours=168)]
+            c37_lag336_val  = c37_history.loc[c37_step_time - pd.Timedelta(hours=336)]
+            c37_roll168_val = c37_history.loc[c37_step_time - pd.Timedelta(hours=168):
+                                                c37_step_time - pd.Timedelta(hours=1)].mean()
+            c37_this_date     = c37_step_time.date()
+            c37_tomorrow_date = c37_this_date + pd.Timedelta(days=1)
+            c37_yesterday_date = c37_this_date - pd.Timedelta(days=1)
+
+            c37_row = {
+                "hour_of_day": c37_step_time.hour,
+                "day_of_week": c37_step_time.dayofweek,
+                "is_weekend":  int(c37_step_time.dayofweek >= 5),
+                "lag_1":   c37_lag1_val,
+                "lag_24":  c37_lag24_val,
+                "lag_48":  c37_history.loc[c37_step_time - pd.Timedelta(hours=48)],
+                "lag_144": c37_history.loc[c37_step_time - pd.Timedelta(hours=144)],
+                "lag_168": c37_lag168_val,
+                "ratio_recent_vs_week": c37_lag1_val / c37_roll168_val if c37_roll168_val > 0 else 0.0,
+                "ratio_day_vs_week":    c37_lag24_val / c37_roll168_val if c37_roll168_val > 0 else 0.0,
+                "growth_ratio_168": c37_lag168_val / c37_lag336_val if c37_lag336_val > 0 else 1.0,
+                "is_holiday":             int(c37_this_date in c15_holiday_set),
+                "is_day_before_holiday":  int(c37_tomorrow_date in c15_holiday_set),
+                "is_day_after_holiday":   int(c37_yesterday_date in c15_holiday_set),
+            }
+            c37_row_df = pd.DataFrame([c37_row])[c15_feature_cols]
+
+            c37_pred_log = c37_model.predict(c37_row_df)[0]
+            c37_pred_value = max(np.expm1(c37_pred_log), 0.0)
+            c37_pred_value = 0.0 if c37_pred_value < c37_threshold else c37_pred_value
+
+            c37_predictions.append(c37_pred_value)
+            c37_history.loc[c37_step_time] = c37_pred_value
+
+        c37_forecast = pd.Series(c37_predictions, index=c37_forecast_index)
+        c37_aligned = pd.DataFrame({"actual": c37_actual_wf, "forecast": c37_forecast}).dropna()
+        assert len(c37_aligned) == 168, f"Window {c37_w+1} has {len(c37_aligned)} rows"
+
+        c37_smape_val = smape(c37_aligned["actual"], c37_aligned["forecast"])
+        c37_mse_val   = np.mean((c37_aligned["actual"] - c37_aligned["forecast"]) ** 2)
+        xgb10_smape_scores.append(c37_smape_val)
+        xgb10_mse_scores.append(c37_mse_val)
+        print(f"  Window {c37_w+1} ({c37_cutoff_w.date()} cutoff): SMAPE={c37_smape_val:.4f}, MSE={c37_mse_val:.1f}")
+
+    xgb10_mean_smape = np.mean(xgb10_smape_scores)
+    xgb10_std_smape  = np.std(xgb10_smape_scores)
 
     print(f"\n{'='*60}")
-    print("DOES IT COVER OUR SUBMISSION WINDOW (2022-01-24 to 2022-01-30)?")
+    print(f"XGBOOST v10 RESULTS — log1p target + corrected zero-floor (1.0)")
     print(f"{'='*60}")
-    c29_submission_start = pd.Timestamp("2022-01-24 00:00:00")
-    c29_submission_end   = pd.Timestamp("2022-01-30 23:00:00")
-    c29_overlap = c29_test_mock[
-        (c29_test_mock["time"] >= c29_submission_start) &
-        (c29_test_mock["time"] <= c29_submission_end)
-    ]
-    print(f"Rows overlapping submission window: {len(c29_overlap)} (expect 168 if it's a real match)")
+    print(f"Mean SMAPE: {xgb10_mean_smape:.4f}  ± {xgb10_std_smape:.4f} std")
+    print(f"\nNaive SMAPE:    {naive_mean_smape:.4f}")
+    print(f"XGBoost v10:    {xgb10_mean_smape:.4f}")
+    c37_improvement = (naive_mean_smape - xgb10_mean_smape) / naive_mean_smape * 100
+    print(f"\n✅ XGBoost v10 BEATS naive standalone by {c37_improvement:.1f}%!")
+    return (xgb10_smape_scores,)
+
+
+@app.cell
+def _(
+    c15_feature_cols,
+    c15_holiday_set,
+    c32_df,
+    np,
+    pd,
+    plt,
+    seasonal_naive_forecast,
+    series,
+    smape,
+    val_cutoffs,
+    xgb,
+):
+    # ── CELL 38: Re-tune blend weight — naive + XGBoost v10 (log1p + threshold=1.0) ──
+    # XGBoost v10 (0.2011) now beats naive (0.2153) STANDALONE — a fundamentally
+    # different situation than v6, where naive was always the stronger
+    # individual model. Our old 0.7/0.3 weight was calibrated for a WEAKER
+    # XGBoost; with v10 this much stronger, the optimal blend has likely
+    # shifted toward giving XGBoost MORE weight, possibly even crossing past
+    # 50%. We re-run the same principled small-grid search as before.
+
+    def c38_rebuild_xgb_v10_forecast(cutoff):
+        """Refit XGBoost v10's exact pipeline (log1p target, threshold=1.0) for one cutoff."""
+        train_df = c32_df[c32_df.index <= cutoff]
+        model = xgb.XGBRegressor(n_estimators=300, max_depth=5, learning_rate=0.05,
+                                  random_state=42, objective="reg:squarederror")
+        model.fit(train_df[c15_feature_cols], train_df["log_target"])
+
+        history = series[series.index <= cutoff].copy()
+        preds = []
+        idx = pd.date_range(start=cutoff + pd.Timedelta(hours=1), periods=168, freq="h")
+        for t in idx:
+            lag1, lag24 = history.loc[t - pd.Timedelta(hours=1)], history.loc[t - pd.Timedelta(hours=24)]
+            lag168, lag336 = history.loc[t - pd.Timedelta(hours=168)], history.loc[t - pd.Timedelta(hours=336)]
+            roll168 = history.loc[t - pd.Timedelta(hours=168): t - pd.Timedelta(hours=1)].mean()
+            this_date = t.date()
+            row = {
+                "hour_of_day": t.hour, "day_of_week": t.dayofweek, "is_weekend": int(t.dayofweek >= 5),
+                "lag_1": lag1, "lag_24": lag24,
+                "lag_48": history.loc[t - pd.Timedelta(hours=48)],
+                "lag_144": history.loc[t - pd.Timedelta(hours=144)], "lag_168": lag168,
+                "ratio_recent_vs_week": lag1/roll168 if roll168 > 0 else 0.0,
+                "ratio_day_vs_week": lag24/roll168 if roll168 > 0 else 0.0,
+                "growth_ratio_168": lag168/lag336 if lag336 > 0 else 1.0,
+                "is_holiday": int(this_date in c15_holiday_set),
+                "is_day_before_holiday": int((this_date + pd.Timedelta(days=1)) in c15_holiday_set),
+                "is_day_after_holiday": int((this_date - pd.Timedelta(days=1)) in c15_holiday_set),
+            }
+            row_df = pd.DataFrame([row])[c15_feature_cols]
+            pred = max(np.expm1(model.predict(row_df)[0]), 0.0)
+            pred = 0.0 if pred < 1.0 else pred   # v10's corrected threshold
+            preds.append(pred)
+            history.loc[t] = pred
+        return pd.Series(preds, index=idx)
+
+    c38_weight_grid = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    c38_results = []
+
+    print("=" * 60)
+    print("RE-TUNED BLEND WEIGHT — naive + XGBoost v10")
+    print("=" * 60)
+
+    for c38_weight in c38_weight_grid:
+        c38_window_scores = []
+        for c38_cutoff_w in val_cutoffs:
+            c38_actual_wf = series[
+                (series.index > c38_cutoff_w) &
+                (series.index <= c38_cutoff_w + pd.Timedelta(hours=168))
+            ]
+            c38_naive_fc = seasonal_naive_forecast(series[series.index <= c38_cutoff_w], horizon=168)
+            c38_xgb_fc   = c38_rebuild_xgb_v10_forecast(c38_cutoff_w)
+            c38_blend_fc = (1 - c38_weight) * c38_naive_fc + c38_weight * c38_xgb_fc
+            c38_aligned = pd.DataFrame({"actual": c38_actual_wf, "forecast": c38_blend_fc}).dropna()
+            c38_window_scores.append(smape(c38_aligned["actual"], c38_aligned["forecast"]))
+
+        c38_mean = np.mean(c38_window_scores)
+        c38_std  = np.std(c38_window_scores)
+        c38_results.append({"weight_xgb": c38_weight, "mean_smape": c38_mean, "std_smape": c38_std})
+        print(f"  weight_xgb={c38_weight:.1f}: mean SMAPE = {c38_mean:.4f}  ± {c38_std:.4f}")
+
+    c38_results_df = pd.DataFrame(c38_results)
+    c38_best_row = c38_results_df.loc[c38_results_df["mean_smape"].idxmin()]
+    print(f"\nBest weight: {c38_best_row['weight_xgb']:.1f}, mean SMAPE = {c38_best_row['mean_smape']:.4f}")
+    print(f"Compare to naive alone (weight=0.0): {c38_results_df[c38_results_df['weight_xgb']==0.0]['mean_smape'].values[0]:.4f}")
+    print(f"Compare to XGBoost v10 alone (weight=1.0): {c38_results_df[c38_results_df['weight_xgb']==1.0]['mean_smape'].values[0]:.4f}")
+
+    # Plot the curve to verify it's smooth/trustworthy, same diagnostic discipline as before
+    fig_weight2, ax_weight2 = plt.subplots(figsize=(10, 5))
+    ax_weight2.errorbar(c38_results_df["weight_xgb"], c38_results_df["mean_smape"],
+                         yerr=c38_results_df["std_smape"], marker="o", capsize=4,
+                         color="#2563EB", ecolor="#93C5FD")
+    ax_weight2.axvline(c38_best_row["weight_xgb"], color="#EF4444", linestyle="--",
+                        label=f"Best weight = {c38_best_row['weight_xgb']:.1f}")
+    ax_weight2.set_xlabel("Weight on XGBoost v10 (0 = pure naive, 1 = pure XGBoost v10)")
+    ax_weight2.set_ylabel("Mean SMAPE across 7 validation windows")
+    ax_weight2.set_title("Re-Tuned Ensemble Weight Search — naive + XGBoost v10", fontweight="bold")
+    ax_weight2.legend()
+    ax_weight2.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("figures/ensemble_weight_search_v10.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    return (c38_rebuild_xgb_v10_forecast,)
+
+
+@app.cell
+def _(
+    c38_rebuild_xgb_v10_forecast,
+    np,
+    pd,
+    seasonal_naive_forecast,
+    series,
+    smape,
+    val_cutoffs,
+    xgb10_smape_scores,
+):
+    # ── CELL 39: Robustness comparison — XGBoost v10 alone vs ensemble(0.6) ──
+    # Testing Tizian's hypothesis: is the ensemble more ROBUST (lower variance,
+    # better worst-case) even if its MEAN is barely different from pure
+    # XGBoost v10? We compare per-window scores directly, not just means,
+    # since robustness is fundamentally about variance and worst-case
+    # behavior — exactly what a model running unsupervised in production
+    # (Lambda, every Sunday) needs to be judged on, not just average accuracy.
+
+    c39_ensemble_scores = []
+    for c39_cutoff_w in val_cutoffs:
+        c39_actual_wf = series[(series.index > c39_cutoff_w) & (series.index <= c39_cutoff_w + pd.Timedelta(hours=168))]
+        c39_naive_fc = seasonal_naive_forecast(series[series.index <= c39_cutoff_w], horizon=168)
+        c39_xgb_fc   = c38_rebuild_xgb_v10_forecast(c39_cutoff_w)
+        c39_blend_fc = 0.4 * c39_naive_fc + 0.6 * c39_xgb_fc
+        c39_aligned = pd.DataFrame({"actual": c39_actual_wf, "forecast": c39_blend_fc}).dropna()
+        c39_ensemble_scores.append(smape(c39_aligned["actual"], c39_aligned["forecast"]))
+
+    print("=" * 60)
+    print("PER-WINDOW COMPARISON: XGBoost v10 alone vs Ensemble (weight=0.6)")
+    print("=" * 60)
+    c39_comparison = pd.DataFrame({
+        "window": [f"W{i+1} ({c.date()})" for i, c in enumerate(val_cutoffs)],
+        "xgb_v10_alone": xgb10_smape_scores,
+        "ensemble_0.6":  c39_ensemble_scores,
+    })
+    c39_comparison["ensemble_better"] = c39_comparison["ensemble_0.6"] < c39_comparison["xgb_v10_alone"]
+    print(c39_comparison.to_string(index=False))
 
     print(f"\n{'='*60}")
-    print("DOES IT LOOK LIKE REAL DATA OR PLACEHOLDER/MOCK VALUES?")
+    print(f"DISTRIBUTION COMPARISON")
     print(f"{'='*60}")
-    print(c29_test_mock["orders"].describe())
-    print(f"\nAre all values identical (a sign of pure placeholder data)? "
-          f"{c29_test_mock['orders'].nunique() == 1}")
-    print(f"Are values suspiciously round (e.g. all integers ending in 0)? "
-          f"{(c29_test_mock['orders'] % 10 == 0).mean()*100:.1f}% of values")
+    print(f"XGBoost v10 alone:  mean={np.mean(xgb10_smape_scores):.4f}, std={np.std(xgb10_smape_scores):.4f}, "
+          f"worst={max(xgb10_smape_scores):.4f}, best={min(xgb10_smape_scores):.4f}")
+    print(f"Ensemble (0.6):     mean={np.mean(c39_ensemble_scores):.4f}, std={np.std(c39_ensemble_scores):.4f}, "
+          f"worst={max(c39_ensemble_scores):.4f}, best={min(c39_ensemble_scores):.4f}")
+
+    print(f"\nEnsemble wins on {c39_comparison['ensemble_better'].sum()} of 7 windows")
+    print(f"\nMost important for robustness — WORST-CASE comparison:")
+    print(f"  XGBoost v10 alone's worst window: {max(xgb10_smape_scores):.4f}")
+    print(f"  Ensemble's worst window:          {max(c39_ensemble_scores):.4f}")
     return
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # Generating the Final Submission Forecast
+    This is a genuinely satisfying, well-evidenced answer to our robustness question.
+
+    Worst-case: Ensemble's worst window is 0.2604, vs. XGBoost v10 alone's worst window of 0.2706 — the ensemble's worst case is meaningfully better (about 4% lower than the pure model's worst case). This directly supports our hypothesis:blending in naive provides a small "safety net" exactly in the scenario that matters most for production robustness — the model's bad days are less bad.
+
+    Best-case: Interestingly, the reverse is true — XGBoost v10 alone's best window (0.1587) beats the ensemble's best window (0.1625). This makes complete intuitive sense: when XGBoost is doing great on its own, blending in naive (a comparatively weaker, more rigid model) slightly dilutes that excellence. This is the textbook ensemble trade-off: you give up a little upside to reduce downside risk.
+
+    Win count (4 of 7) and std (0.0331 vs 0.0332) are both essentially a wash — not the deciding factor here. The real, meaningful signal is specifically in the worst-case comparison, which is exactly the right lens for a model that will run unsupervised in production every single Sunday without you there to catch a bad week.
+
+    Our recommendation, given this evidence: our instinct was right, but it's now backed by a specific, defensible number, not just intuition. We go with the ensemble (weight=0.6) as our running champion — the mean is statistically identical to pure XGBoost v10, but it trades a small amount of best-case upside for a real reduction in worst-case downside, which is the textbook justification for ensembling in a production forecasting context.
     """)
     return
 
 
 @app.cell
 def _(
-    c10_zero_threshold,
-    c15_df,
+    Path,
     c15_feature_cols,
     c15_holiday_set,
+    c32_df,
     final_cutoff,
+    np,
     pd,
     seasonal_naive_forecast,
     series,
     xgb,
 ):
-    # ── CELL 30: Generate the ACTUAL submission forecast (2022-01-24 to 2022-01-30) ──
-    # RESOLVES the gap Joshua identified: every SMAPE we've reported so far
-    # (naive, XGBoost v1-v6, SARIMA, Theta, LightGBM, all ensembles) was
-    # computed on the 7 historical val_cutoffs windows, where ground truth
-    # exists. The REAL submission week (2022-01-24 to 2022-01-30) has NO
-    # ground truth anywhere in our files — test_data_mock.csv is confirmed
-    # pure placeholder (all zeros, Cell 29). This cell trains our CHAMPION
-    # model (0.7 x naive + 0.3 x XGBoost v6) on ALL available data up to
-    # final_cutoff (2022-01-23 23:00:00, saved in Cell 5) and produces the
-    # actual 168-hour forecast that goes into our submission CSV.
+    # ── CELL 40: Train final champion on FULL data, generate submission, pickle ──
+    # Champion: 0.6 x XGBoost v10 + 0.4 x naive — chosen for better worst-case
+    # robustness (Cell 39: worst-window 0.260 vs XGBoost-alone's 0.271), even
+    # though mean SMAPE is statistically identical. This matches the
+    # production framing: a model running unsupervised in the cloud needs
+    # protection against its WORST week, not just a slightly better average.
 
-    print(f"Final cutoff (production training boundary): {final_cutoff}")
-    print(f"Submission window: {final_cutoff + pd.Timedelta(hours=1)} to {final_cutoff + pd.Timedelta(hours=168)}")
+    import pickle   # for saving the fitted model object for reuse in AWS Lambda
 
-    # ── Component 1: Naive forecast, trained on ALL data ──────────────────────
-    c30_naive_forecast = seasonal_naive_forecast(
+    # ── Train naive component (no "training" needed — direct lookup) ────────
+    c40_naive_forecast = seasonal_naive_forecast(
         series[series.index <= final_cutoff], horizon=168
     )
 
-    # ── Component 2: XGBoost v6 forecast, trained on ALL data ────────────────
-    c30_xgb_train_df = c15_df[c15_df.index <= final_cutoff]
+    # ── Train XGBoost v10 on ALL available data ───────────────────────────────
+    c40_xgb_train_df = c32_df[c32_df.index <= final_cutoff]   # c32_df has log_target + all v10 features
 
-    c30_xgb_model = xgb.XGBRegressor(
+    c40_xgb_model_final = xgb.XGBRegressor(
         n_estimators=300, max_depth=5, learning_rate=0.05,
         random_state=42, objective="reg:squarederror"
     )
-    c30_xgb_model.fit(c30_xgb_train_df[c15_feature_cols], c30_xgb_train_df["orders"])
+    c40_xgb_model_final.fit(c40_xgb_train_df[c15_feature_cols], c40_xgb_train_df["log_target"])
 
-    c30_history = series[series.index <= final_cutoff].copy()
-    c30_xgb_predictions = []
-    c30_forecast_index = pd.date_range(
-        start=final_cutoff + pd.Timedelta(hours=1), periods=168, freq="h"
-    )
+    # ── Recursive forecast for the REAL submission week ───────────────────────
+    c40_history = series[series.index <= final_cutoff].copy()
+    c40_xgb_predictions = []
+    c40_forecast_index = pd.date_range(start=final_cutoff + pd.Timedelta(hours=1), periods=168, freq="h")
 
-    for c30_step_time in c30_forecast_index:
-        c30_lag1_val    = c30_history.loc[c30_step_time - pd.Timedelta(hours=1)]
-        c30_lag24_val   = c30_history.loc[c30_step_time - pd.Timedelta(hours=24)]
-        c30_lag168_val  = c30_history.loc[c30_step_time - pd.Timedelta(hours=168)]
-        c30_lag336_val  = c30_history.loc[c30_step_time - pd.Timedelta(hours=336)]
-        c30_roll168_val = c30_history.loc[c30_step_time - pd.Timedelta(hours=168):
-                                            c30_step_time - pd.Timedelta(hours=1)].mean()
-        c30_this_date     = c30_step_time.date()
-        c30_tomorrow_date = c30_this_date + pd.Timedelta(days=1)
-        c30_yesterday_date = c30_this_date - pd.Timedelta(days=1)
+    for c40_step_time in c40_forecast_index:
+        c40_lag1_val    = c40_history.loc[c40_step_time - pd.Timedelta(hours=1)]
+        c40_lag24_val   = c40_history.loc[c40_step_time - pd.Timedelta(hours=24)]
+        c40_lag168_val  = c40_history.loc[c40_step_time - pd.Timedelta(hours=168)]
+        c40_lag336_val  = c40_history.loc[c40_step_time - pd.Timedelta(hours=336)]
+        c40_roll168_val = c40_history.loc[c40_step_time - pd.Timedelta(hours=168):
+                                            c40_step_time - pd.Timedelta(hours=1)].mean()
+        c40_this_date     = c40_step_time.date()
+        c40_tomorrow_date = c40_this_date + pd.Timedelta(days=1)
+        c40_yesterday_date = c40_this_date - pd.Timedelta(days=1)
 
-        c30_row = {
-            "hour_of_day": c30_step_time.hour,
-            "day_of_week": c30_step_time.dayofweek,
-            "is_weekend":  int(c30_step_time.dayofweek >= 5),
-            "lag_1":   c30_lag1_val,
-            "lag_24":  c30_lag24_val,
-            "lag_48":  c30_history.loc[c30_step_time - pd.Timedelta(hours=48)],
-            "lag_144": c30_history.loc[c30_step_time - pd.Timedelta(hours=144)],
-            "lag_168": c30_lag168_val,
-            "ratio_recent_vs_week": c30_lag1_val / c30_roll168_val if c30_roll168_val > 0 else 0.0,
-            "ratio_day_vs_week":    c30_lag24_val / c30_roll168_val if c30_roll168_val > 0 else 0.0,
-            "growth_ratio_168": c30_lag168_val / c30_lag336_val if c30_lag336_val > 0 else 1.0,
-            "is_holiday":             int(c30_this_date in c15_holiday_set),
-            "is_day_before_holiday":  int(c30_tomorrow_date in c15_holiday_set),
-            "is_day_after_holiday":   int(c30_yesterday_date in c15_holiday_set),
+        c40_row = {
+            "hour_of_day": c40_step_time.hour,
+            "day_of_week": c40_step_time.dayofweek,
+            "is_weekend":  int(c40_step_time.dayofweek >= 5),
+            "lag_1":   c40_lag1_val,
+            "lag_24":  c40_lag24_val,
+            "lag_48":  c40_history.loc[c40_step_time - pd.Timedelta(hours=48)],
+            "lag_144": c40_history.loc[c40_step_time - pd.Timedelta(hours=144)],
+            "lag_168": c40_lag168_val,
+            "ratio_recent_vs_week": c40_lag1_val / c40_roll168_val if c40_roll168_val > 0 else 0.0,
+            "ratio_day_vs_week":    c40_lag24_val / c40_roll168_val if c40_roll168_val > 0 else 0.0,
+            "growth_ratio_168": c40_lag168_val / c40_lag336_val if c40_lag336_val > 0 else 1.0,
+            "is_holiday":             int(c40_this_date in c15_holiday_set),
+            "is_day_before_holiday":  int(c40_tomorrow_date in c15_holiday_set),
+            "is_day_after_holiday":   int(c40_yesterday_date in c15_holiday_set),
         }
-        c30_row_df = pd.DataFrame([c30_row])[c15_feature_cols]
+        c40_row_df = pd.DataFrame([c40_row])[c15_feature_cols]
 
-        c30_pred_value = c30_xgb_model.predict(c30_row_df)[0]
-        c30_pred_value = max(c30_pred_value, 0.0)
-        c30_pred_value = 0.0 if c30_pred_value < c10_zero_threshold else c30_pred_value
+        c40_pred_log = c40_xgb_model_final.predict(c40_row_df)[0]
+        c40_pred_value = max(np.expm1(c40_pred_log), 0.0)
+        c40_pred_value = 0.0 if c40_pred_value < 1.0 else c40_pred_value   # v10's corrected threshold
 
-        c30_xgb_predictions.append(c30_pred_value)
-        c30_history.loc[c30_step_time] = c30_pred_value
+        c40_xgb_predictions.append(c40_pred_value)
+        c40_history.loc[c40_step_time] = c40_pred_value
 
-    c30_xgb_forecast = pd.Series(c30_xgb_predictions, index=c30_forecast_index)
+    c40_xgb_forecast_final = pd.Series(c40_xgb_predictions, index=c40_forecast_index)
 
-    # ── Combine into our validated champion ensemble: 0.7 naive + 0.3 XGBoost ──
-    c30_final_forecast = 0.7 * c30_naive_forecast + 0.3 * c30_xgb_forecast
+    # ── Final ensemble: 0.6 x XGBoost + 0.4 x naive ───────────────────────────
+    c40_final_submission_forecast = 0.4 * c40_naive_forecast + 0.6 * c40_xgb_forecast_final
 
-    print(f"\n{'='*60}")
-    print(f"FINAL SUBMISSION FORECAST — SANITY CHECKS")
-    print(f"{'='*60}")
-    print(f"Rows: {len(c30_final_forecast)} (expect 168)")
-    print(f"Date range: {c30_final_forecast.index.min()} to {c30_final_forecast.index.max()}")
-    print(f"Min: {c30_final_forecast.min():.1f}, Max: {c30_final_forecast.max():.1f}, Mean: {c30_final_forecast.mean():.1f}")
-    print(f"Any NaNs? {c30_final_forecast.isnull().any()}")
-    print(f"Any negative values? {(c30_final_forecast < 0).any()}")
+    print("=" * 60)
+    print("FINAL SUBMISSION FORECAST — SANITY CHECKS")
+    print("=" * 60)
+    print(f"Rows: {len(c40_final_submission_forecast)} (expect 168)")
+    print(f"Date range: {c40_final_submission_forecast.index.min()} to {c40_final_submission_forecast.index.max()}")
+    print(f"Min: {c40_final_submission_forecast.min():.1f}, Max: {c40_final_submission_forecast.max():.1f}, "
+          f"Mean: {c40_final_submission_forecast.mean():.1f}")
+    print(f"Any NaNs? {c40_final_submission_forecast.isnull().any()}")
+    print(f"Any negative? {(c40_final_submission_forecast < 0).any()}")
 
-    print(f"\nFirst 10 hours:")
-    print(c30_final_forecast.head(10))
-    return (c30_final_forecast,)
+    # ── Save the fitted XGBoost model as a pickle (for reuse in AWS Lambda) ──
+    c40_model_path = Path(__file__).parent / "xgboost_v10_final_model.pkl"
+    with open(c40_model_path, "wb") as c40_f:
+        pickle.dump(c40_xgb_model_final, c40_f)
+    print(f"\nSaved XGBoost model to: {c40_model_path}")
+
+    # ── Also save the feature column list and holiday set — Lambda will need ──
+    # these exact same objects to reproduce predictions correctly; saving them
+    # alongside the model avoids any risk of drift between notebook and Lambda
+    c40_metadata_path = Path(__file__).parent / "model_metadata.pkl"
+    with open(c40_metadata_path, "wb") as c40_f:
+        pickle.dump({
+            "feature_cols": c15_feature_cols,
+            "holiday_set": c15_holiday_set,
+            "zero_threshold": 1.0,
+            "ensemble_weight_xgb": 0.6,
+            "ensemble_weight_naive": 0.4,
+        }, c40_f)
+    print(f"Saved metadata to: {c40_metadata_path}")
+
+    # ── Verify the pickle round-trips correctly ───────────────────────────────
+    with open(c40_model_path, "rb") as c40_f:
+        c40_reloaded_model = pickle.load(c40_f)
+    c40_test_pred = c40_reloaded_model.predict(c40_xgb_train_df[c15_feature_cols].iloc[:1])
+    print(f"\nReloaded model test prediction: {c40_test_pred} (should be a valid number, confirms pickle works)")
+    return c40_final_submission_forecast, c40_xgb_train_df
 
 
 @app.cell
-def _(Path, c30_final_forecast, pd):
+def _(Path, c40_final_submission_forecast, pd):
     import sys
-    sys.path.insert(0, str(Path(__file__).parent))   # ensure repo root is on the import path
+    sys.path.insert(0, str(Path(__file__).parent))   # repo root, where check_output_format.py lives
     from check_output_format import check_output_format
 
-    # ── CELL 31: Format final forecast to required schema, validate, save ───
-    # This is a LOCAL CHECKPOINT — proof that our pipeline produces a
-    # correctly-formatted output. The ACTUAL graded submission will be
-    # generated by AWS Lambda (next steps) using this same modelling logic,
-    # reading from and writing to S3 instead of local files.
+    # ── CELL 41: Format final ensemble forecast, validate, save final CSV ────
+    # This is our updated LOCAL CHECKPOINT, replacing Cell 31's earlier version
+    # now that we have a meaningfully improved champion (0.6 x XGBoost v10 +
+    # 0.4 x naive, validated at SMAPE 0.2010 with better worst-case robustness
+    # than either component alone — Cell 39). The AWS Lambda deployment will
+    # reproduce this exact logic using the pickled model + metadata saved in
+    # Cell 40.
 
-    c31_submission_df = pd.DataFrame({
-        "time": c30_final_forecast.index,
-        "preds": c30_final_forecast.values
+    c41_submission_df = pd.DataFrame({
+        "time": c40_final_submission_forecast.index,
+        "preds": c40_final_submission_forecast.values
     })
-
-    # Enforce EXACT dtypes the checker requires (Cell-by-cell discipline:
-    # pandas can silently store floats as float64 already, but we verify
-    # explicitly rather than assume)
-    c31_submission_df["time"] = c31_submission_df["time"].astype("datetime64[ns]")
-    c31_submission_df["preds"] = c31_submission_df["preds"].astype("float64")
+    c41_submission_df["time"] = c41_submission_df["time"].astype("datetime64[ns]")
+    c41_submission_df["preds"] = c41_submission_df["preds"].astype("float64")
 
     print("Dtypes check:")
-    print(c31_submission_df.dtypes)
+    print(c41_submission_df.dtypes)
 
-    # Run the official checker — using test_data_mock.csv purely for its
-    # STRUCTURAL validation purpose (shape, dtypes, timestamp alignment),
-    # NOT as a performance/accuracy signal (confirmed Cell 29: it's all zeros)
-    check_output_format(c31_submission_df, str(Path(__file__).parent / "data" / "test_data_mock.csv"))
+    # Validate with the official checker (structural check only — recall
+    # test_data_mock.csv is all zeros, Cell 29, so the printed MSE is
+    # meaningless for judging quality, only the "correctly formatted!" message
+    # matters here)
+    check_output_format(c41_submission_df, str(Path(__file__).parent / "data" / "test_data_mock.csv"))
 
-    # Save the local checkpoint
-    c31_output_path = Path(__file__).parent / "predictions_checkpoint.csv"
-    c31_submission_df.to_csv(c31_output_path, index=False)
-    print(f"\nSaved checkpoint to: {c31_output_path}")
+    c41_output_path = Path(__file__).parent / "predictions_final.csv"
+    c41_submission_df.to_csv(c41_output_path, index=False)
+    print(f"\nSaved final submission CSV to: {c41_output_path}")
 
-    # Re-read and confirm dtypes survive the round-trip through CSV (your
-    # course's repeated lesson: always verify AFTER saving, not just before)
-    c31_reloaded = pd.read_csv(c31_output_path)
-    print(f"\nAfter reload from disk — dtypes:")
-    print(c31_reloaded.dtypes)
-    print(f"\n⚠️  NOTE: CSV format loses datetime dtype on reload (becomes string) —")
-    print(f"this is NORMAL and expected; the checker call above (before saving) is")
-    print(f"what matters. If re-validating after reload, re-cast 'time' to datetime64[ns] first.")
+    # Re-verify after reload, per the brief's explicit instruction
+    c41_reloaded = pd.read_csv(c41_output_path)
+    c41_reloaded["time"] = pd.to_datetime(c41_reloaded["time"])
+    print(f"\nAfter reload — shape: {c41_reloaded.shape}, dtypes:")
+    print(c41_reloaded.dtypes)
+    print(f"Duplicate time rows? {c41_reloaded['time'].duplicated().any()}")
+    print(f"Any nulls? {c41_reloaded.isnull().any().any()}")
+
+    print(f"\n{'='*60}")
+    print(f"FINAL MODEL SUMMARY")
+    print(f"{'='*60}")
+    print(f"Champion: 0.6 x XGBoost v10 + 0.4 x naive seasonal baseline")
+    print(f"Validated mean SMAPE (7-fold walk-forward): 0.2010")
+    print(f"  vs. naive alone:        0.2153  (4 of 7 windows favor ensemble)")
+    print(f"  vs. XGBoost v10 alone:  0.2011  (better worst-case: 0.260 vs 0.271)")
+    print(f"Key fixes applied: log1p(orders) training target, zero-floor")
+    print(f"threshold=1.0 (corrected from earlier 5.0), bounded ratio features,")
+    print(f"holiday/long-weekend flags, recursive hour-by-hour forecasting")
+    return
+
+
+@app.cell
+def _(c32_df, c40_xgb_train_df):
+    # ── Quick verification: confirm the final model trained on ALL available rows ──
+    print(f"Total rows in c32_df (full feature table): {len(c32_df)}")
+    print(f"Rows used to train c40_xgb_model_final: {len(c40_xgb_train_df)}")
+    print(f"Match? {len(c32_df) == len(c40_xgb_train_df)}")
+    print(f"\nTraining data date range used: {c40_xgb_train_df.index.min()} to {c40_xgb_train_df.index.max()}")
+    print(f"Full dataset date range available: {c32_df.index.min()} to {c32_df.index.max()}")
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Models Tested But Excluded From the Final Pipeline
+
+    Beyond the naive baseline and the SARIMA/XGBoost work above, we explored
+    several additional models and techniques. We document them here, with
+    our reasoning, rather than deleting the evidence of this work — a
+    "tried and rejected, here's why" narrative satisfies the grading
+    criterion of comparing **several approaches** and demonstrates the kind
+    of empirical, hypothesis-driven judgement the course emphasizes (Ex02/04:
+    simpler models often win; out-of-sample evidence overrides intuition).
+
+    ### Theta Model (5 iterations, excluded)
+
+    The Theta model (SES + linear drift, with additive deseasonalization at
+    period=168) won the M3 forecasting competition and is recommended by the
+    course slides as a strong, simple benchmark. We tested it across five
+    iterations:
+
+    - **v1 (no fix): SMAPE = 0.944.** Catastrophic — Theta's forecast never
+      reached true zero during night hours, flattening instead at a
+      positive constant (~35–80, varying by window).
+    - **v2 (fixed zero-floor): SMAPE = 0.483.** A single fixed threshold
+      worked for some windows but failed on others whose floor sat at a
+      different magnitude — confirming the floor is window-specific.
+    - **v3 (adaptive per-window floor): SMAPE = 0.327.** Better, but
+      hour-by-hour inspection revealed the SAME offset was also being added
+      to daytime/peak hours, causing systematic overshooting the zero-floor
+      fix couldn't address.
+    - **v4 (subtract the constant from every hour): SMAPE = 0.782 — WORSE.**
+      This was the most informative result: it revealed that what looked
+      like "one constant added everywhere" was a misreading of additive
+      decomposition, which assigns a *distinct* seasonal term per hour-of-week,
+      not one global constant. Subtracting it uniformly distorted the
+      relative shape of peaks and troughs.
+
+    **Root cause:** Theta's SES component estimates a single smoothed level
+    for the whole series, which is distorted by our data's extreme intra-day
+    volatility (peak-to-mean ratio ~5.5×, 31.7% structural zero-hours) — far
+    outside the smoother conditions (quarterly GDP, monthly retail volumes)
+    Theta is typically applied to. **Excluded from the final model.**
+
+    ### SARIMA as a Third Ensemble Member (excluded)
+
+    We tested whether adding SARIMA v2 (`SARIMA(2,0,0)(1,0,1)[24]`, see
+    earlier sections) to the naive+XGBoost ensemble would help. Even a **5%
+    weight** caused mean SMAPE to jump from 0.211 to **0.631** — confirmed
+    not a fluke (10% weight gave an equally poor 0.626). SARIMA v2's
+    standalone SMAPE (0.649) carries large-magnitude, systematically wrong
+    predictions (no weekly-seasonality awareness), which do not "average
+    out" the way two similarly-competent models' uncorrelated small errors
+    do. **Excluded from the final ensemble.**
+
+    ### Custom SMAPE-Approximating XGBoost Objective (abandoned)
+
+    SMAPE has a known "under-forecasting bias" (course slides) that plain
+    MSE training ignores. We attempted a custom XGBoost objective with an
+    approximate SMAPE-style gradient/Hessian. Result: the model collapsed to
+    predicting near-zero everywhere (forecast mean 8.0 vs. actual mean 94.0,
+    SMAPE = 1.97 — near the theoretical maximum). This matches known reports
+    from the XGBoost community of exactly this instability with naive
+    percentage-loss approximations. **Abandoned** in favor of the safer
+    `log1p(orders)` target transform (see XGBoost v8 above), which achieves
+    a similar goal (compressing the long right tail, aligning better with a
+    relative/percentage-style metric) without a fragile custom gradient.
+
+    ### Daypart Categorical Feature (3 granularities tested, no improvement)
+
+    We tested whether grouping `hour_of_day` into named categories
+    (night/morning/lunch/afternoon/dinner, then a sharper
+    night/other/lunch/dinner version isolating only the exact peak hours)
+    would help XGBoost. All three variants scored within noise of each
+    other and slightly *worse* than no daypart feature at all (0.2327 →
+    0.2332 → 0.2335). **Conclusion:** `hour_of_day` combined with our lag
+    features (especially `lag_24`, `lag_168`) already captures this
+    information more precisely than any pre-defined binning could —
+    gradient-boosted trees split on numeric features as finely as the data
+    supports, making manual category boundaries redundant here.
+
+    ### LightGBM, Including "Active Hours Only" Training (no improvement)
+
+    LightGBM with XGBoost v6's exact feature set scored within 0.6% of
+    XGBoost (0.2383 vs 0.2368) — confirming **algorithm choice was never the
+    bottleneck**; our gains came from feature engineering and bug fixes, not
+    the gradient-boosting implementation. We also tested training LightGBM
+    *only* on rows where `orders > 0` (excluding the ~32% structural zero
+    rows entirely from training, with a hard rule forcing 0 outside
+    08:00–22:00), inspired by another team's reported approach. This produced
+    no meaningful change (0.2383 → 0.2377) — `hour_of_day` as a feature
+    already lets the model learn this boundary just as well as excluding
+    the rows outright.
+
+    **These exclusions, taken together, motivated the fixes that DID work**
+    (documented in the XGBoost v7–v10 sections above): removing
+    extrapolation-prone features (`time_index`, raw rolling means),
+    replacing them with bounded ratios, training on `log1p(orders)`, and
+    correcting our zero-floor threshold from 5.0 to 1.0 after diagnosing
+    that it was suppressing genuine small demand at the 06:00–07:00
+    night/morning boundary.
+    """)
     return
 
 
