@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.2"
+__generated_with = "0.23.11"
 app = marimo.App(width="full")
 
 
@@ -182,7 +182,7 @@ def _():
     print(
         f"Rows to predict:  {pd.date_range(forecast_start, forecast_end, freq='h').shape[0]}"
     )
-    return mdates, np, orders, pd, plt
+    return Path, mdates, np, orders, pd, plt
 
 
 @app.cell
@@ -1109,6 +1109,7 @@ def _(np, orders_filled, pd):
     print("actual+forecast scale — this is our bar to beat.")
     return (
         N_VAL_WEEKS,
+        final_cutoff,
         naive_mean_smape,
         naive_smape_scores,
         seasonal_naive_forecast,
@@ -6020,7 +6021,6 @@ def _(
     else:
         c25_gap_naive = (lgbm_mean_smape - naive_mean_smape) / naive_mean_smape * 100
         print(f"❌ LightGBM still WORSE than naive by {c25_gap_naive:.1f}%")
-
     return lgb, lgbm_mean_smape
 
 
@@ -6384,6 +6384,215 @@ def _(
     print(f"Naive:                          {naive_mean_smape:.4f}")
     print(f"LightGBM (all-hours training):  {lgbm_mean_smape:.4f}")
     print(f"LightGBM (active-only training):{lgbm2_mean_smape:.4f}")
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    # Checking the structure of the mock test set
+    """)
+    return
+
+
+@app.cell
+def _(Path, pd):
+    # ── CELL 29: Inspect test_data_mock.csv before deciding how to use it ────
+    # We need to know exactly what's inside this file before treating it as
+    # ground truth for the real submission week. The brief explicitly warns:
+    # "The real holdout may differ; the format checker still applies" — meaning
+    # this file might contain MOCK/PLACEHOLDER values, not genuine Jan 24-30
+    # orders. We check directly rather than assume either way.
+
+    c29_test_mock = pd.read_csv(Path(__file__).parent / "data" / "test_data_mock.csv")
+    c29_test_mock["time"] = pd.to_datetime(c29_test_mock["time"])
+
+    print("=" * 60)
+    print("test_data_mock.csv — STRUCTURE")
+    print("=" * 60)
+    print(f"Shape: {c29_test_mock.shape}")
+    print(f"Columns: {c29_test_mock.columns.tolist()}")
+    print(f"Time range: {c29_test_mock['time'].min()} to {c29_test_mock['time'].max()}")
+    print(f"\nFirst 5 rows:")
+    print(c29_test_mock.head())
+    print(f"\nLast 5 rows:")
+    print(c29_test_mock.tail())
+
+    print(f"\n{'='*60}")
+    print("DOES IT COVER OUR SUBMISSION WINDOW (2022-01-24 to 2022-01-30)?")
+    print(f"{'='*60}")
+    c29_submission_start = pd.Timestamp("2022-01-24 00:00:00")
+    c29_submission_end   = pd.Timestamp("2022-01-30 23:00:00")
+    c29_overlap = c29_test_mock[
+        (c29_test_mock["time"] >= c29_submission_start) &
+        (c29_test_mock["time"] <= c29_submission_end)
+    ]
+    print(f"Rows overlapping submission window: {len(c29_overlap)} (expect 168 if it's a real match)")
+
+    print(f"\n{'='*60}")
+    print("DOES IT LOOK LIKE REAL DATA OR PLACEHOLDER/MOCK VALUES?")
+    print(f"{'='*60}")
+    print(c29_test_mock["orders"].describe())
+    print(f"\nAre all values identical (a sign of pure placeholder data)? "
+          f"{c29_test_mock['orders'].nunique() == 1}")
+    print(f"Are values suspiciously round (e.g. all integers ending in 0)? "
+          f"{(c29_test_mock['orders'] % 10 == 0).mean()*100:.1f}% of values")
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    # Generating the Final Submission Forecast
+    """)
+    return
+
+
+@app.cell
+def _(
+    c10_zero_threshold,
+    c15_df,
+    c15_feature_cols,
+    c15_holiday_set,
+    final_cutoff,
+    pd,
+    seasonal_naive_forecast,
+    series,
+    xgb,
+):
+    # ── CELL 30: Generate the ACTUAL submission forecast (2022-01-24 to 2022-01-30) ──
+    # RESOLVES the gap Joshua identified: every SMAPE we've reported so far
+    # (naive, XGBoost v1-v6, SARIMA, Theta, LightGBM, all ensembles) was
+    # computed on the 7 historical val_cutoffs windows, where ground truth
+    # exists. The REAL submission week (2022-01-24 to 2022-01-30) has NO
+    # ground truth anywhere in our files — test_data_mock.csv is confirmed
+    # pure placeholder (all zeros, Cell 29). This cell trains our CHAMPION
+    # model (0.7 x naive + 0.3 x XGBoost v6) on ALL available data up to
+    # final_cutoff (2022-01-23 23:00:00, saved in Cell 5) and produces the
+    # actual 168-hour forecast that goes into our submission CSV.
+
+    print(f"Final cutoff (production training boundary): {final_cutoff}")
+    print(f"Submission window: {final_cutoff + pd.Timedelta(hours=1)} to {final_cutoff + pd.Timedelta(hours=168)}")
+
+    # ── Component 1: Naive forecast, trained on ALL data ──────────────────────
+    c30_naive_forecast = seasonal_naive_forecast(
+        series[series.index <= final_cutoff], horizon=168
+    )
+
+    # ── Component 2: XGBoost v6 forecast, trained on ALL data ────────────────
+    c30_xgb_train_df = c15_df[c15_df.index <= final_cutoff]
+
+    c30_xgb_model = xgb.XGBRegressor(
+        n_estimators=300, max_depth=5, learning_rate=0.05,
+        random_state=42, objective="reg:squarederror"
+    )
+    c30_xgb_model.fit(c30_xgb_train_df[c15_feature_cols], c30_xgb_train_df["orders"])
+
+    c30_history = series[series.index <= final_cutoff].copy()
+    c30_xgb_predictions = []
+    c30_forecast_index = pd.date_range(
+        start=final_cutoff + pd.Timedelta(hours=1), periods=168, freq="h"
+    )
+
+    for c30_step_time in c30_forecast_index:
+        c30_lag1_val    = c30_history.loc[c30_step_time - pd.Timedelta(hours=1)]
+        c30_lag24_val   = c30_history.loc[c30_step_time - pd.Timedelta(hours=24)]
+        c30_lag168_val  = c30_history.loc[c30_step_time - pd.Timedelta(hours=168)]
+        c30_lag336_val  = c30_history.loc[c30_step_time - pd.Timedelta(hours=336)]
+        c30_roll168_val = c30_history.loc[c30_step_time - pd.Timedelta(hours=168):
+                                            c30_step_time - pd.Timedelta(hours=1)].mean()
+        c30_this_date     = c30_step_time.date()
+        c30_tomorrow_date = c30_this_date + pd.Timedelta(days=1)
+        c30_yesterday_date = c30_this_date - pd.Timedelta(days=1)
+
+        c30_row = {
+            "hour_of_day": c30_step_time.hour,
+            "day_of_week": c30_step_time.dayofweek,
+            "is_weekend":  int(c30_step_time.dayofweek >= 5),
+            "lag_1":   c30_lag1_val,
+            "lag_24":  c30_lag24_val,
+            "lag_48":  c30_history.loc[c30_step_time - pd.Timedelta(hours=48)],
+            "lag_144": c30_history.loc[c30_step_time - pd.Timedelta(hours=144)],
+            "lag_168": c30_lag168_val,
+            "ratio_recent_vs_week": c30_lag1_val / c30_roll168_val if c30_roll168_val > 0 else 0.0,
+            "ratio_day_vs_week":    c30_lag24_val / c30_roll168_val if c30_roll168_val > 0 else 0.0,
+            "growth_ratio_168": c30_lag168_val / c30_lag336_val if c30_lag336_val > 0 else 1.0,
+            "is_holiday":             int(c30_this_date in c15_holiday_set),
+            "is_day_before_holiday":  int(c30_tomorrow_date in c15_holiday_set),
+            "is_day_after_holiday":   int(c30_yesterday_date in c15_holiday_set),
+        }
+        c30_row_df = pd.DataFrame([c30_row])[c15_feature_cols]
+
+        c30_pred_value = c30_xgb_model.predict(c30_row_df)[0]
+        c30_pred_value = max(c30_pred_value, 0.0)
+        c30_pred_value = 0.0 if c30_pred_value < c10_zero_threshold else c30_pred_value
+
+        c30_xgb_predictions.append(c30_pred_value)
+        c30_history.loc[c30_step_time] = c30_pred_value
+
+    c30_xgb_forecast = pd.Series(c30_xgb_predictions, index=c30_forecast_index)
+
+    # ── Combine into our validated champion ensemble: 0.7 naive + 0.3 XGBoost ──
+    c30_final_forecast = 0.7 * c30_naive_forecast + 0.3 * c30_xgb_forecast
+
+    print(f"\n{'='*60}")
+    print(f"FINAL SUBMISSION FORECAST — SANITY CHECKS")
+    print(f"{'='*60}")
+    print(f"Rows: {len(c30_final_forecast)} (expect 168)")
+    print(f"Date range: {c30_final_forecast.index.min()} to {c30_final_forecast.index.max()}")
+    print(f"Min: {c30_final_forecast.min():.1f}, Max: {c30_final_forecast.max():.1f}, Mean: {c30_final_forecast.mean():.1f}")
+    print(f"Any NaNs? {c30_final_forecast.isnull().any()}")
+    print(f"Any negative values? {(c30_final_forecast < 0).any()}")
+
+    print(f"\nFirst 10 hours:")
+    print(c30_final_forecast.head(10))
+    return (c30_final_forecast,)
+
+
+@app.cell
+def _(Path, c30_final_forecast, pd):
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))   # ensure repo root is on the import path
+    from check_output_format import check_output_format
+
+    # ── CELL 31: Format final forecast to required schema, validate, save ───
+    # This is a LOCAL CHECKPOINT — proof that our pipeline produces a
+    # correctly-formatted output. The ACTUAL graded submission will be
+    # generated by AWS Lambda (next steps) using this same modelling logic,
+    # reading from and writing to S3 instead of local files.
+
+    c31_submission_df = pd.DataFrame({
+        "time": c30_final_forecast.index,
+        "preds": c30_final_forecast.values
+    })
+
+    # Enforce EXACT dtypes the checker requires (Cell-by-cell discipline:
+    # pandas can silently store floats as float64 already, but we verify
+    # explicitly rather than assume)
+    c31_submission_df["time"] = c31_submission_df["time"].astype("datetime64[ns]")
+    c31_submission_df["preds"] = c31_submission_df["preds"].astype("float64")
+
+    print("Dtypes check:")
+    print(c31_submission_df.dtypes)
+
+    # Run the official checker — using test_data_mock.csv purely for its
+    # STRUCTURAL validation purpose (shape, dtypes, timestamp alignment),
+    # NOT as a performance/accuracy signal (confirmed Cell 29: it's all zeros)
+    check_output_format(c31_submission_df, str(Path(__file__).parent / "data" / "test_data_mock.csv"))
+
+    # Save the local checkpoint
+    c31_output_path = Path(__file__).parent / "predictions_checkpoint.csv"
+    c31_submission_df.to_csv(c31_output_path, index=False)
+    print(f"\nSaved checkpoint to: {c31_output_path}")
+
+    # Re-read and confirm dtypes survive the round-trip through CSV (your
+    # course's repeated lesson: always verify AFTER saving, not just before)
+    c31_reloaded = pd.read_csv(c31_output_path)
+    print(f"\nAfter reload from disk — dtypes:")
+    print(c31_reloaded.dtypes)
+    print(f"\n⚠️  NOTE: CSV format loses datetime dtype on reload (becomes string) —")
+    print(f"this is NORMAL and expected; the checker call above (before saving) is")
+    print(f"what matters. If re-validating after reload, re-cast 'time' to datetime64[ns] first.")
     return
 
 
